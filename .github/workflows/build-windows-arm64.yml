@@ -17,25 +17,36 @@ jobs:
           python-version: "3.12"
           architecture: "arm64"
 
+      - name: Confirm architecture
+        shell: pwsh
+        run: |
+          python -c "import platform; print(platform.machine()); print(platform.architecture())"
+
       - name: Patch out lameenc / force WAV
         shell: pwsh
         run: |
-          python - <<'PY'
+          @'
           from pathlib import Path
 
-          p = Path("audio_recorder.py")
-          s = p.read_text(encoding="utf-8")
+          for p in Path(".").rglob("*.py"):
+              s = p.read_text(encoding="utf-8", errors="ignore")
 
-          s = s.replace("import lameenc", "# import lameenc  # disabled for Windows ARM64 build")
+              original = s
 
-          # Disable MP3 branch by making any mp3 format request fall back to wav.
-          s = s.replace('format="mp3"', 'format="wav"')
-          s = s.replace("format='mp3'", "format='wav'")
-          s = s.replace('"mp3"', '"wav"')
-          s = s.replace("'mp3'", "'wav'")
+              s = s.replace("import lameenc", "# import lameenc  # disabled for Windows ARM64 build")
+              s = s.replace("from lameenc import Encoder", "# from lameenc import Encoder  # disabled for Windows ARM64 build")
 
-          p.write_text(s, encoding="utf-8")
-          PY
+              # Force obvious MP3 format references to WAV.
+              s = s.replace('"mp3"', '"wav"')
+              s = s.replace("'mp3'", "'wav'")
+              s = s.replace(".mp3", ".wav")
+              s = s.replace("MP3", "WAV")
+              s = s.replace("mp3", "wav")
+
+              if s != original:
+                  p.write_text(s, encoding="utf-8")
+                  print(f"patched {p}")
+          '@ | python
 
       - name: Install dependencies
         shell: pwsh
