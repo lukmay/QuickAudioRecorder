@@ -1,4 +1,4 @@
-name: Build Windows ARM64
+name: Build Windows ARM64 with MP3
 
 on:
   workflow_dispatch:
@@ -22,37 +22,28 @@ jobs:
         run: |
           python -c "import platform; print(platform.machine()); print(platform.architecture())"
 
-      - name: Patch out lameenc / force WAV
+      - name: Set up MSVC ARM64 build tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install Python dependencies except lameenc
         shell: pwsh
         run: |
-          @'
-          from pathlib import Path
-
-          for p in Path(".").rglob("*.py"):
-              s = p.read_text(encoding="utf-8", errors="ignore")
-
-              original = s
-
-              s = s.replace("import lameenc", "# import lameenc  # disabled for Windows ARM64 build")
-              s = s.replace("from lameenc import Encoder", "# from lameenc import Encoder  # disabled for Windows ARM64 build")
-
-              # Force obvious MP3 format references to WAV.
-              s = s.replace('"mp3"', '"wav"')
-              s = s.replace("'mp3'", "'wav'")
-              s = s.replace(".mp3", ".wav")
-              s = s.replace("MP3", "WAV")
-              s = s.replace("mp3", "wav")
-
-              if s != original:
-                  p.write_text(s, encoding="utf-8")
-                  print(f"patched {p}")
-          '@ | python
-
-      - name: Install dependencies
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip setuptools wheel build cmake
           pip install PyQt6 soundcard soundfile numpy keyboard pyinstaller
+
+      - name: Build and install lameenc from source
+        shell: pwsh
+        run: |
+          git clone https://github.com/chrisstaite/lameenc.git
+          cd lameenc
+          python -m pip install . --no-binary lameenc -v
+
+      - name: Verify lameenc
+        shell: pwsh
+        run: |
+          python -c "import lameenc; print('lameenc imported OK')"
 
       - name: Build exe
         shell: pwsh
@@ -62,5 +53,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QuickAudioRecorder-windows-arm64-wav-only
+          name: QuickAudioRecorder-windows-arm64-mp3
           path: dist/QuickAudioRecorder.exe
