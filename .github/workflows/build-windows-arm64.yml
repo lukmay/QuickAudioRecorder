@@ -1,0 +1,40 @@
+name: Build Windows ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ARM64
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "arm64"
+
+      - name: Confirm architecture
+        shell: pwsh
+        run: |
+          python -c "import platform; print(platform.machine()); print(platform.architecture())"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install PyQt6 soundcard soundfile numpy lameenc keyboard pyinstaller
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconsole --onefile --name QuickAudioRecorder main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickAudioRecorder-windows-arm64
+          path: dist/QuickAudioRecorder.exe
