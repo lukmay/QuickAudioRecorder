@@ -17,16 +17,31 @@ jobs:
           python-version: "3.12"
           architecture: "arm64"
 
-      - name: Confirm architecture
+      - name: Patch out lameenc / force WAV
         shell: pwsh
         run: |
-          python -c "import platform; print(platform.machine()); print(platform.architecture())"
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("audio_recorder.py")
+          s = p.read_text(encoding="utf-8")
+
+          s = s.replace("import lameenc", "# import lameenc  # disabled for Windows ARM64 build")
+
+          # Disable MP3 branch by making any mp3 format request fall back to wav.
+          s = s.replace('format="mp3"', 'format="wav"')
+          s = s.replace("format='mp3'", "format='wav'")
+          s = s.replace('"mp3"', '"wav"')
+          s = s.replace("'mp3'", "'wav'")
+
+          p.write_text(s, encoding="utf-8")
+          PY
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install PyQt6 soundcard soundfile numpy lameenc keyboard pyinstaller
+          pip install PyQt6 soundcard soundfile numpy keyboard pyinstaller
 
       - name: Build exe
         shell: pwsh
@@ -36,5 +51,5 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: QuickAudioRecorder-windows-arm64
+          name: QuickAudioRecorder-windows-arm64-wav-only
           path: dist/QuickAudioRecorder.exe
