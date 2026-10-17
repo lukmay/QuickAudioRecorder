@@ -80,7 +80,7 @@ https://github.com/user-attachments/assets/14238816-c1ee-4914-9211-5f0007bfe999
 ## Installation
 
 1.  Go to the [Releases](https://github.com/lukmay/QuickAudioRecorder/releases) page.
-2.  Download `QuickAudioRecorder.exe`.
+2.  Download `QuickAudioRecorder.exe`, or `QuickAudioRecorder-arm64.exe` on a Windows ARM device (e.g. a Snapdragon laptop).
 3.  Run it! (No installation required).
 
 The exe is built by [GitHub Actions](.github/workflows/release.yml) straight from the tagged source, and each release has a `.sha256` file to check the download against. Some antivirus scanners flag PyInstaller apps in general. If you would rather not trust a binary, [build it yourself](#build-from-source).

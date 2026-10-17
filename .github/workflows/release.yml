@@ -1,23 +1,37 @@
 name: Release build
 
 # Builds the exe from the tagged source on GitHub's runners, so every
-# release binary can be traced back to a commit.
+# release binary can be traced back to a commit. Run it by hand to check
+# the build without releasing.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      # one after the other, so only the first job creates the draft release
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+            exe: QuickAudioRecorder
+          - runner: windows-11-arm
+            arch: arm64
+            exe: QuickAudioRecorder-arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: ${{ matrix.arch }}
 
       - name: Install dependencies
         run: pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard pyinstaller pytest
@@ -27,15 +41,16 @@ jobs:
 
       - name: Build
         # UPX-packed exes get flagged by antivirus scanners far more often (#10)
-        run: pyinstaller --noconsole --onefile --noupx --name QuickAudioRecorder main.py
+        run: pyinstaller --noconsole --onefile --noupx --name ${{ matrix.exe }} main.py
 
       - name: Checksum
         shell: pwsh
-        run: (Get-FileHash dist/QuickAudioRecorder.exe -Algorithm SHA256).Hash + "  QuickAudioRecorder.exe" | Out-File -Encoding ascii dist/QuickAudioRecorder.exe.sha256
+        run: (Get-FileHash dist/${{ matrix.exe }}.exe -Algorithm SHA256).Hash + "  ${{ matrix.exe }}.exe" | Out-File -Encoding ascii dist/${{ matrix.exe }}.exe.sha256
 
       - name: Upload to release
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view ${{ github.ref_name }} || gh release create ${{ github.ref_name }} --draft --title "QuickAudioRecorder ${{ github.ref_name }}" --notes ""
-          gh release upload ${{ github.ref_name }} dist/QuickAudioRecorder.exe dist/QuickAudioRecorder.exe.sha256 --clobber
+          gh release upload ${{ github.ref_name }} dist/${{ matrix.exe }}.exe dist/${{ matrix.exe }}.exe.sha256 --clobber
