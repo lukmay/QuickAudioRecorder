@@ -7,12 +7,12 @@ import time
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow, 
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
                              QPushButton, QFileDialog, QMessageBox, QGroupBox, 
-                             QLineEdit, QFormLayout, QCheckBox, QSpinBox)
+                             QLineEdit, QFormLayout, QCheckBox, QSpinBox, QScrollArea)
 from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence
 from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent, QTimer
 import soundcard as sc
 import keyboard
-from audio_recorder import AudioRecorder, get_devices
+from audio_recorder import AudioRecorder, get_devices, get_speakers
 from clipboard_utils import copy_file_to_clipboard
 
 CONFIG_FILE = "settings.json"
@@ -25,7 +25,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 class SignalManager(QObject):
-    recording_finished = pyqtSignal(str, str)
+    recording_finished = pyqtSignal(object, str)  # a path, or a list when tracks are separate
     saving = pyqtSignal()
     progress = pyqtSignal(float)
     hotkey = pyqtSignal(str)
@@ -104,6 +104,79 @@ class HotkeyEdit(QLineEdit):
         self.current_sequence = final_hotkey
         self.clearFocus()
 
+class TrackEditor(QWidget):
+    """One row of the track list: which source this track captures."""
+
+    KIND_INPUT = "Input Device"
+    KIND_OUTPUT = "Output (System Audio)"
+
+    removed = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loading = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItems([self.KIND_INPUT, self.KIND_OUTPUT])
+        self.kind_combo.currentIndexChanged.connect(self.on_kind_changed)
+        layout.addWidget(self.kind_combo, 2)
+
+        self.device_combo = QComboBox()
+        layout.addWidget(self.device_combo, 3)
+
+        btn_remove = QPushButton("Remove")
+        btn_remove.clicked.connect(lambda: self.removed.emit(self))
+        layout.addWidget(btn_remove)
+
+    def current_kind(self):
+        return "output" if self.kind_combo.currentText() == self.KIND_OUTPUT else "input"
+
+    def on_kind_changed(self, _index=None):
+        if not self._loading:
+            self.refresh_devices()
+
+    def refresh_devices(self):
+        """Fills the device list for the selected kind."""
+        self._loading = True
+        try:
+            self.device_combo.clear()
+            if self.current_kind() == "input":
+                for device in get_devices(include_loopback=False):
+                    self.device_combo.addItem(device["name"], device["id"])
+                default_id = sc.default_microphone().id
+            else:
+                for speaker in get_speakers():
+                    self.device_combo.addItem(speaker["name"], speaker["id"])
+                default_id = sc.default_speaker().id
+            index = self.device_combo.findData(default_id)
+            if index >= 0:
+                self.device_combo.setCurrentIndex(index)
+        except Exception as e:
+            print(f"Error refreshing devices: {e}")
+        finally:
+            self._loading = False
+
+    def get_track(self):
+        if self.current_kind() == "input":
+            return {"kind": "input", "input_id": self.device_combo.currentData()}
+        return {"kind": "output", "speaker_id": self.device_combo.currentData()}
+
+    def set_track(self, track):
+        kind = str(track.get("kind") or "input").strip().lower()
+        self._loading = True
+        self.kind_combo.setCurrentText(self.KIND_OUTPUT if kind == "output" else self.KIND_INPUT)
+        self._loading = False
+        self.refresh_devices()
+        wanted = track.get("speaker_id") if kind == "output" else track.get("input_id")
+        if wanted is not None:
+            index = self.device_combo.findData(wanted)
+            if index >= 0:
+                self.device_combo.setCurrentIndex(index)
+
+
 class SettingsWindow(QMainWindow):
     settings_saved = pyqtSignal()
 
@@ -114,6 +187,8 @@ class SettingsWindow(QMainWindow):
         
         self.init_ui()
         self.load_settings()
+        if not self.track_editors():
+            self.add_track()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -121,16 +196,25 @@ class SettingsWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
-        # Microphone
-        group_mic = QGroupBox("Input Device")
-        layout_mic = QVBoxLayout()
-        self.combo_mic = QComboBox()
-        layout_mic.addWidget(self.combo_mic)
+        # Tracks captured simultaneously
+        group_tracks = QGroupBox("Tracks")
+        layout_tracks = QVBoxLayout()
+        self.tracks_area = QScrollArea()
+        self.tracks_area.setWidgetResizable(True)
+        self.tracks_area.setMinimumHeight(110)
+        self.tracks_container = QWidget()
+        self.tracks_layout = QVBoxLayout(self.tracks_container)
+        self.tracks_layout.addStretch(1)
+        self.tracks_area.setWidget(self.tracks_container)
+        layout_tracks.addWidget(self.tracks_area)
+        btn_add_track = QPushButton("Add Track")
+        btn_add_track.clicked.connect(lambda: self.add_track())
+        layout_tracks.addWidget(btn_add_track)
         btn_refresh = QPushButton("Refresh Devices")
         btn_refresh.clicked.connect(self.refresh_devices)
-        layout_mic.addWidget(btn_refresh)
-        group_mic.setLayout(layout_mic)
-        layout.addWidget(group_mic)
+        layout_tracks.addWidget(btn_refresh)
+        group_tracks.setLayout(layout_tracks)
+        layout.addWidget(group_tracks)
 
         # Output
         group_out = QGroupBox("Output Configuration")
@@ -146,9 +230,13 @@ class SettingsWindow(QMainWindow):
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems(["MP3", "WAV", "FLAC"])
         self.chk_mono = QCheckBox("Save as mono (half the size, good for voice)")
+        self.combo_output_mode = QComboBox()
+        self.combo_output_mode.addItem("Mixed (one file)", "mixed")
+        self.combo_output_mode.addItem("Separate files", "separate_files")
         
         layout_out.addRow("Folder:", layout_folder_inner)
         layout_out.addRow("Format:", self.combo_fmt)
+        layout_out.addRow("Output mode:", self.combo_output_mode)
         layout_out.addRow("", self.chk_mono)
         group_out.setLayout(layout_out)
         layout.addWidget(group_out)
@@ -156,9 +244,6 @@ class SettingsWindow(QMainWindow):
         # Tray Interaction
         group_tray = QGroupBox("Tray Icon Behavior")
         layout_tray = QFormLayout()
-        self.combo_left_click = QComboBox()
-        self.combo_left_click.addItems(["Last Used", "Microphone", "Loopback", "Both"])
-        layout_tray.addRow("Left Click Action:", self.combo_left_click)
         self.spin_auto_stop = QSpinBox()
         self.spin_auto_stop.setRange(0, 24 * 60)
         self.spin_auto_stop.setSuffix(" min")
@@ -207,18 +292,44 @@ class SettingsWindow(QMainWindow):
         self.refresh_devices()
 
     def refresh_devices(self):
-        self.combo_mic.clear()
-        try:
-            mics = get_devices(include_loopback=False)
-            default_mic = sc.default_microphone()
-            default_index = 0
-            for i, m in enumerate(mics):
-                self.combo_mic.addItem(f"{m['name']}", m['id'])
-                if m['id'] == default_mic.id:
-                    default_index = i
-            self.combo_mic.setCurrentIndex(default_index)
-        except Exception as e:
-            print(f"Error refreshing devices: {e}")
+        for editor in self.track_editors():
+            editor.refresh_devices()
+
+    def add_track(self, track=None):
+        """Appends a track row, optionally seeded from a saved track dict."""
+        editor = TrackEditor()
+        editor.removed.connect(self.remove_track)
+        self.tracks_layout.insertWidget(self.tracks_layout.count() - 1, editor)
+        editor.refresh_devices()
+        if track:
+            editor.set_track(track)
+        return editor
+
+    def remove_track(self, editor):
+        if len(self.track_editors()) <= 1:
+            QMessageBox.information(self, "Tracks", "At least one track is required.")
+            return
+        self.tracks_layout.removeWidget(editor)
+        editor.setParent(None)
+        editor.deleteLater()
+
+    def track_editors(self):
+        """The live track rows, in display order."""
+        editors = []
+        for i in range(self.tracks_layout.count()):
+            widget = self.tracks_layout.itemAt(i).widget()
+            if isinstance(widget, TrackEditor):
+                editors.append(widget)
+        return editors
+
+    def clear_tracks(self):
+        for editor in self.track_editors():
+            self.tracks_layout.removeWidget(editor)
+            editor.setParent(None)
+            editor.deleteLater()
+
+    def get_tracks(self):
+        return [editor.get_track() for editor in self.track_editors()]
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", options=QFileDialog.Option.DontUseNativeDialog)
@@ -235,14 +346,14 @@ class SettingsWindow(QMainWindow):
                 fmt_idx = self.combo_fmt.findText(data.get("format", "MP3"))
                 if fmt_idx >= 0: self.combo_fmt.setCurrentIndex(fmt_idx)
                 
-                saved_id = data.get("device_id")
-                if saved_id:
-                    idx = self.combo_mic.findData(saved_id)
-                    if idx >= 0: self.combo_mic.setCurrentIndex(idx)
+                self.clear_tracks()
+                for track in data.get("tracks") or []:
+                    self.add_track(track)
+                if not self.track_editors():
+                    self.add_track({"kind": "input", "input_id": data.get("device_id")})
+                mode_idx = self.combo_output_mode.findData(data.get("output_mode", "mixed"))
+                if mode_idx >= 0: self.combo_output_mode.setCurrentIndex(mode_idx)
 
-                mode = data.get("tray_click_mode", "Last Used")
-                mode_idx = self.combo_left_click.findText(mode)
-                if mode_idx >= 0: self.combo_left_click.setCurrentIndex(mode_idx)
                 self.spin_auto_stop.setValue(data.get("auto_stop_min", 0))
                 self.chk_notifications.setChecked(data.get("notifications", True))
 
@@ -270,12 +381,15 @@ class SettingsWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
 
     def get_settings(self):
+        tracks = self.get_tracks()
+        first_input = next((t.get("input_id") for t in tracks if t.get("kind") == "input"), None)
         return {
-            "device_id": self.combo_mic.currentData(),
+            "device_id": first_input,
+            "tracks": tracks,
+            "output_mode": self.combo_output_mode.currentData(),
             "output_folder": self.lbl_folder.text(),
             "format": self.combo_fmt.currentText(),
             "mono": self.chk_mono.isChecked(),
-            "tray_click_mode": self.combo_left_click.currentText(),
             "auto_stop_min": self.spin_auto_stop.value(),
             "notifications": self.chk_notifications.isChecked(),
             "normalize": self.chk_normalize.isChecked(),
@@ -292,7 +406,6 @@ class TrayApplication(QObject):
         super().__init__()
         self.app = app
         self.recorder = None
-        self.last_mode = "mic" 
         
         self.signals = SignalManager()
         self.signals.recording_finished.connect(self.on_recording_finished)
@@ -352,12 +465,9 @@ class TrayApplication(QObject):
 
     def build_menu(self):
         self.menu = QMenu()
-        self.action_record_mic = QAction("Start Recording (Mic)", self)
-        self.action_record_mic.triggered.connect(lambda: self.start_recording("mic"))
-        self.action_record_loop = QAction("Start Recording (Loopback)", self)
-        self.action_record_loop.triggered.connect(lambda: self.start_recording("loopback"))
-        self.action_record_both = QAction("Start Recording (Both)", self)
-        self.action_record_both.triggered.connect(lambda: self.start_recording("both"))
+        # One way in: the track list in Settings decides what gets captured.
+        self.action_record = QAction("Start Recording", self)
+        self.action_record.triggered.connect(lambda: self.start_recording())
         self.action_stop = QAction("Stop Recording", self)
         self.action_stop.triggered.connect(self.stop_recording)
         self.action_stop.setEnabled(False)
@@ -366,9 +476,7 @@ class TrayApplication(QObject):
         self.action_exit = QAction("Exit", self)
         self.action_exit.triggered.connect(self.exit_app)
         
-        self.menu.addAction(self.action_record_mic)
-        self.menu.addAction(self.action_record_loop)
-        self.menu.addAction(self.action_record_both)
+        self.menu.addAction(self.action_record)
         self.menu.addAction(self.action_stop)
         self.menu.addSeparator()
         self.menu.addAction(self.action_settings)
@@ -407,54 +515,52 @@ class TrayApplication(QObject):
             if self.recorder and self.recorder.is_alive():
                 self.stop_recording()
             else:
-                settings = self.settings_window.get_settings()
-                click_mode = settings.get("tray_click_mode", "Last Used")
-                target_mode = self.last_mode
-                if click_mode == "Microphone": target_mode = "mic"
-                elif click_mode == "Loopback": target_mode = "loopback"
-                elif click_mode == "Both": target_mode = "both"
-                self.start_recording(target_mode)
+                # Left click toggles recording with the configured tracks.
+                self.start_recording()
 
     def open_settings(self):
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
-    def start_recording(self, mode="mic"):
+    def start_recording(self, mode="tracks"):
         if self.recorder and self.recorder.is_alive(): return
-        self.last_mode = mode    
         settings = self.settings_window.get_settings()
         target_id = settings['device_id']
+        use_tracks = mode == "tracks"
         
         def finish_callback(path, error):
             self.signals.recording_finished.emit(path if path else "", error if error else "")
 
+        # "tracks" records the configured track list; the older mic/loopback/
+        # both modes stay available as one-track shortcuts.
+        source = ({"tracks": settings.get("tracks")} if use_tracks
+                  else {"mic_id": target_id, "source_mode": mode})
         self.recorder = AudioRecorder(
-            mic_id=target_id,
-            source_mode=mode,
             output_folder=settings['output_folder'],
             output_format=settings['format'],
             normalize=settings['normalize'],
             mono=settings['mono'],
+            output_mode=settings.get('output_mode', 'mixed'),
             on_finish_callback=finish_callback,
             on_progress=self.signals.progress.emit,
-            on_notice=self.signals.recording_notice.emit
+            on_notice=self.signals.recording_notice.emit,
+            **source
         )
         self.recorder.start()
-        self.action_record_mic.setEnabled(False)
-        self.action_record_loop.setEnabled(False)
-        self.action_record_both.setEnabled(False)
+        self.action_record.setEnabled(False)
         self.action_stop.setEnabled(True)
         self.tray_icon.setIcon(QIcon(self.icon_rec_path)) 
         self.tray_icon.setToolTip(f"Recording ({mode}) 00:00")
         self.rec_started = time.monotonic()
         self.rec_timer.start()
-        self.notify("Started", f"Recording {mode}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
+        label = "%d tracks" % len(settings.get("tracks") or []) if use_tracks else mode
+        self.notify("Started", f"Recording {label}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
 
     def on_recording_tick(self):
         elapsed = int(time.monotonic() - self.rec_started)
         minutes, seconds = divmod(elapsed, 60)
-        self.tray_icon.setToolTip(f"Recording ({self.last_mode}) {minutes:02d}:{seconds:02d}")
+        self.tray_icon.setToolTip(f"Recording {minutes:02d}:{seconds:02d}")
         limit = self.settings_window.get_settings()["auto_stop_min"]
         if limit and elapsed >= limit * 60:
             self.stop_recording()
@@ -506,48 +612,51 @@ class TrayApplication(QObject):
 
     def on_recording_finished(self, path, error):
         self.rec_timer.stop()
-        self.action_record_mic.setEnabled(True)
-        self.action_record_loop.setEnabled(True)
-        self.action_record_both.setEnabled(True)
+        self.action_record.setEnabled(True)
         self.action_stop.setEnabled(False)
         self.action_stop.setText("Stop Recording")
         self.tray_icon.setIcon(QIcon(self.icon_idle_path))
         self.tray_icon.setToolTip("Simple Audio Recorder (Idle)")
         self.recorder = None
-        
+
+        # separate-track mode finishes with a list; mixed mode with one path
+        paths = [p for p in (path if isinstance(path, (list, tuple)) else [path]) if p]
+
         # a partial recording comes back with a path and an error, keep it and warn
-        if error and not (path and os.path.exists(path)):
+        if error and not any(os.path.exists(p) for p in paths):
             self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
             return
-            
+
         settings = self.settings_window.get_settings()
-        final_path = path
-        msg = f"Saved to {os.path.basename(path)}"
+        if len(paths) == 1:
+            msg = f"Saved to {os.path.basename(paths[0])}"
+        else:
+            msg = "Saved %d tracks:\n%s" % (len(paths), "\n".join(os.path.basename(p) for p in paths))
         if error:
             msg += f"\nWarning: {error}"
-        
-        if settings['clipboard'] and os.path.exists(path):
+
+        keepers = [p for p in paths if os.path.exists(p)]
+        if settings['clipboard'] and keepers:
             try:
                 if settings['delete_after']:
                     temp_dir = tempfile.gettempdir()
-                    new_path = os.path.join(temp_dir, os.path.basename(path))
-                    if os.path.exists(new_path):
-                        base, ext = os.path.splitext(new_path)
-                        new_path = f"{base}_{int(time.time())}{ext}"
-                    shutil.move(path, new_path)
-                    final_path = new_path
+                    moved = []
+                    for p in keepers:
+                        new_path = os.path.join(temp_dir, os.path.basename(p))
+                        if os.path.exists(new_path):
+                            base, ext = os.path.splitext(new_path)
+                            new_path = f"{base}_{int(time.time())}{ext}"
+                        shutil.move(p, new_path)
+                        moved.append(new_path)
+                    keepers = moved
                     msg = "Moved to Temp & Copied to Clipboard."
-                else:
-                    msg += "\nCopied to clipboard."
 
-                # Use Robust Clipboard Utility
-                success, status = copy_file_to_clipboard(final_path)
-                if not success:
-                    msg += f"\nClipboard Error: {status}"
-                else:
-                    # Optional: Log success?
-                    pass
-                
+                for p in keepers:
+                    success, status = copy_file_to_clipboard(p)
+                    if not success:
+                        msg += f"\nClipboard Error: {status}"
+                if not settings['delete_after']:
+                    msg += "\nCopied to clipboard."
             except Exception as e:
                 msg += f"\nClipboard/Move error: {e}"
 

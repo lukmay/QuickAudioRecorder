@@ -74,6 +74,7 @@ def fake_sc(monkeypatch):
         default_speaker=lambda: speaker,
         default_microphone=lambda: mic,
         all_microphones=lambda include_loopback=False: [mic, loop] if include_loopback else [mic],
+        all_speakers=lambda: [speaker],
         get_microphone=lambda id, include_loopback=False: mic,
     )
     monkeypatch.setattr(audio_recorder, "sc", fake)

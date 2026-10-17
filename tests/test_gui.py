@@ -90,7 +90,8 @@ def test_tooltip_shows_elapsed_time(tray):
     tray.start_recording("mic")
     tray.rec_started -= 75
     tray.on_recording_tick()
-    assert tray.tray_icon.toolTip() == "Recording (mic) 01:15"
+    # the tray no longer carries a per-mode label, just the elapsed time
+    assert tray.tray_icon.toolTip() == "Recording 01:15"
 
 
 def test_auto_stop(tray):

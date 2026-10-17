@@ -10,6 +10,57 @@ import lameenc
 import numpy as np
 import tempfile
 
+# Track kinds and output modes for the track list.
+TRACK_KIND_INPUT = "input"
+TRACK_KIND_OUTPUT = "output"
+TRACK_KIND_APP = "application"
+TRACK_KINDS = (TRACK_KIND_INPUT, TRACK_KIND_OUTPUT, TRACK_KIND_APP)
+TRACK_LABELS = {TRACK_KIND_INPUT: "input", TRACK_KIND_OUTPUT: "output",
+                TRACK_KIND_APP: "application"}
+VALID_OUTPUT_MODES = ("mixed", "separate_files")
+
+
+def normalize_output_mode(output_mode):
+    mode = str(output_mode or "mixed").strip().lower()
+    if mode not in VALID_OUTPUT_MODES:
+        raise ValueError(f"Unsupported output mode: {output_mode}")
+    return mode
+
+
+def normalize_tracks(tracks):
+    """Validates a track list and fills in defaults. Returns a new list."""
+    if not tracks:
+        raise ValueError("At least one track is required")
+    cleaned = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError(f"Unsupported track: {track!r}")
+        kind = str(track.get("kind") or TRACK_KIND_INPUT).strip().lower()
+        if kind not in TRACK_KINDS:
+            raise ValueError(f"Unsupported track kind: {track.get('kind')}")
+        entry = {"kind": kind}
+        if kind == TRACK_KIND_INPUT:
+            entry["input_id"] = track.get("input_id")
+        elif kind == TRACK_KIND_OUTPUT:
+            entry["speaker_id"] = track.get("speaker_id")
+        else:
+            entry["target_pid"] = track.get("target_pid")
+            entry["target_name"] = track.get("target_name")
+        cleaned.append(entry)
+    return cleaned
+
+
+def tracks_from_mode(mic_id, source_mode):
+    """Maps the older single-source interface onto a track list."""
+    mode = str(source_mode or "mic").strip().lower()
+    if mode == "loopback":
+        return [{"kind": TRACK_KIND_OUTPUT, "speaker_id": None}]
+    if mode == "both":
+        return [{"kind": TRACK_KIND_INPUT, "input_id": mic_id},
+                {"kind": TRACK_KIND_OUTPUT, "speaker_id": None}]
+    return [{"kind": TRACK_KIND_INPUT, "input_id": mic_id}]
+
+
 class PortAudioDevice:
     """
     Fallback for microphones soundcard can't open. soundcard only handles
@@ -128,9 +179,9 @@ class AudioRecorder(threading.Thread):
     """
     Orchestrates recording from Microphone, Loopback, or Both.
     """
-    def __init__(self, mic_id, source_mode, output_folder, output_format="mp3", 
+    def __init__(self, mic_id=None, source_mode=None, output_folder=None, output_format="mp3",
                  normalize=False, mono=False, on_finish_callback=None, on_progress=None,
-                 on_notice=None):
+                 on_notice=None, tracks=None, output_mode="mixed"):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
@@ -141,71 +192,96 @@ class AudioRecorder(threading.Thread):
         self.callback = on_finish_callback
         self.on_progress = on_progress  # called with 0..1 while saving
         self.on_notice = on_notice  # called with a message if a device is lost
+
+        # The track list is the source of truth. mic_id/source_mode are the
+        # older single-source interface and are mapped onto a matching list.
+        self.tracks = normalize_tracks(tracks if tracks is not None
+                                       else tracks_from_mode(mic_id, source_mode))
+        self.output_mode = normalize_output_mode(output_mode)
         
         self.recording = False
         self.stop_event = threading.Event()
         self.error_message = None
         self.final_filepath = None
+        self.final_filepaths = []
+        self.track_labels = []
         
         # Temp files
         self.temp_files = []
         self.recorders = []
 
-    def _get_device(self, is_loopback):
-        if is_loopback:
-            default_speaker = sc.default_speaker()
-            mics = sc.all_microphones(include_loopback=True)
-            loopback_mic = next((m for m in mics if m.name == default_speaker.name), None)
-            if not loopback_mic:
-                loopback_mic = next((m for m in mics if default_speaker.name in m.name), None)
-            if not loopback_mic:
-                available = [m.name for m in mics if m.isloopback] if any(hasattr(m, 'isloopback') for m in mics) else [m.name for m in mics]
+    def _get_loopback_for(self, speaker_id=None):
+        """The loopback device that mirrors the given (or default) speaker."""
+        if speaker_id:
+            speakers = sc.all_speakers()
+            speaker = next((s for s in speakers if s.id == speaker_id), None)
+            if speaker is None:
                 raise Exception(
-                    f"No loopback device found for speaker '{default_speaker.name}'. "
-                    f"Available loopback devices: {available}"
+                    f"Speaker '{speaker_id}' not found. "
+                    f"Available: {[s.name for s in speakers]}"
                 )
-            return loopback_mic
         else:
-            try:
-                return sc.get_microphone(self.mic_id, include_loopback=False)
-            except Exception as e:
-                available = [m.name for m in sc.all_microphones()]
-                raise Exception(
-                    f"Microphone '{self.mic_id}' not found ({e}). "
-                    f"Available: {available}"
-                ) from e
+            speaker = sc.default_speaker()
+
+        mics = sc.all_microphones(include_loopback=True)
+        loopback_mic = next((m for m in mics if m.name == speaker.name), None)
+        if not loopback_mic:
+            loopback_mic = next((m for m in mics if speaker.name in m.name), None)
+        if not loopback_mic:
+            available = [m.name for m in mics if getattr(m, 'isloopback', False)]
+            raise Exception(
+                f"No loopback device found for speaker '{speaker.name}'. "
+                f"Available loopback devices: {available}"
+            )
+        return loopback_mic
+
+    def _get_input_device(self, input_id=None):
+        try:
+            return sc.get_microphone(input_id, include_loopback=False)
+        except Exception as e:
+            available = [m.name for m in sc.all_microphones()]
+            raise Exception(
+                f"Microphone '{input_id}' not found ({e}). "
+                f"Available: {available}"
+            ) from e
+
+    def _get_track_device(self, track):
+        if track["kind"] == TRACK_KIND_INPUT:
+            return self._get_input_device(track.get("input_id"))
+        return self._get_loopback_for(track.get("speaker_id"))
+
+    def _get_device(self, is_loopback):
+        """Legacy helper for the older mic/loopback mode interface."""
+        if is_loopback:
+            return self._get_loopback_for()
+        return self._get_input_device(self.mic_id)
 
     def run(self):
         self.recording = True
         self.error_message = None
         self.temp_files = []
         self.recorders = []
+        self.track_labels = []
+        self.final_filepaths = []
         
         try:
-            # 1. Setup Recorders
-            if self.source_mode == "both":
-                # Need two recorders
-                dev_mic = self._get_device(is_loopback=False)
-                dev_loop = self._get_device(is_loopback=True)
-                
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                t2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1, t2]
-                
-                self.recorders.append(RawRecorder(dev_mic, t1))
-                self.recorders.append(RawRecorder(dev_loop, t2))
-                
-            elif self.source_mode == "loopback":
-                dev = self._get_device(is_loopback=True)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
-                
-            else: # mic
-                dev = self._get_device(is_loopback=False)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
+            # 1. Setup Recorders - one per configured track. Labels get a
+            # number when a kind repeats, so two tracks never share a filename.
+            kind_counts = {}
+            for track in self.tracks:
+                kind_counts[track["kind"]] = kind_counts.get(track["kind"], 0) + 1
+            seen = {}
+            for track in self.tracks:
+                label = TRACK_LABELS.get(track["kind"], "track")
+                if kind_counts[track["kind"]] > 1:
+                    seen[label] = seen.get(label, 0) + 1
+                    label = "%s%d" % (label, seen[label])
+                self.track_labels.append(label)
+
+                device = self._get_track_device(track)
+                temp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                self.temp_files.append(temp_path)
+                self.recorders.append(RawRecorder(device, temp_path))
 
             # Probe before starting so both sources start close together.
             # The loopback gets asked for the mic's rate first, so mixing
@@ -218,7 +294,8 @@ class AudioRecorder(threading.Thread):
                 except Exception as e:
                     raise Exception(f"Recording failed on '{r.device.name}': {e}") from e
 
-            print(f"Starting recording mode: {self.source_mode}")
+            print(f"Starting recording with {len(self.recorders)} track(s): "
+                  f"{', '.join(self.track_labels)}")
 
             # 2. Start Recording
             for r in self.recorders:
@@ -246,12 +323,28 @@ class AudioRecorder(threading.Thread):
                 os.makedirs(self.output_folder)
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"Recording_{timestamp}.{self.output_format}"
-            self.final_filepath = os.path.join(self.output_folder, filename)
 
             sources = [sf.SoundFile(t) for t in self.temp_files]
             try:
-                self._write_output(sources, self.final_filepath)
+                if self.output_mode == "separate_files" and len(sources) > 1:
+                    # Keep one file per track, all at the shared mix rate so
+                    # they describe the same span and can be re-mixed later.
+                    mix_rate = self._plan_mix(sources)[0]
+                    self.final_filepaths = []
+                    for source, label in zip(sources, self.track_labels):
+                        path = os.path.join(
+                            self.output_folder,
+                            f"Recording_{timestamp}_{label}.{self.output_format}")
+                        self._write_output([source], path, samplerate=mix_rate)
+                        self.final_filepaths.append(path)
+                    self.final_filepath = self.final_filepaths
+                else:
+                    path = os.path.join(
+                        self.output_folder,
+                        f"Recording_{timestamp}.{self.output_format}")
+                    self._write_output(sources, path)
+                    self.final_filepaths = [path]
+                    self.final_filepath = path
             finally:
                 for s in sources:
                     s.close()
@@ -278,7 +371,7 @@ class AudioRecorder(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-    def _plan_mix(self, sources):
+    def _plan_mix(self, sources, samplerate=None):
         """Output rate, channels and length, plus a read ratio per source.
 
         The first source (the mic in "both" mode) sets the rate. A source
@@ -286,7 +379,7 @@ class AudioRecorder(threading.Thread):
         which fixes clock drift between devices on long recordings instead
         of letting mic and system audio slowly drift apart.
         """
-        samplerate = sources[0].samplerate
+        samplerate = samplerate or sources[0].samplerate
         channels = max(s.channels for s in sources)
         lengths = [s.frames * samplerate / s.samplerate for s in sources]
         length = int(round(max(lengths)))
@@ -323,8 +416,8 @@ class AudioRecorder(threading.Thread):
             data = np.concatenate((data, np.zeros((count - len(data), data.shape[1]), dtype='float32')))
         return data
 
-    def _mixed_blocks(self, sources, gains=None, block=65536):
-        samplerate, channels, length, ratios = self._plan_mix(sources)
+    def _mixed_blocks(self, sources, gains=None, block=65536, samplerate=None):
+        samplerate, channels, length, ratios = self._plan_mix(sources, samplerate)
         gains = gains or [1.0] * len(sources)
         for start in range(0, length, block):
             count = min(block, length - start)
@@ -334,8 +427,8 @@ class AudioRecorder(threading.Thread):
                 mixed += g * self._read_block(s, start, count, ratio)
             yield np.clip(mixed, -1.0, 1.0)
 
-    def _write_output(self, sources, path):
-        samplerate, channels, length, _ = self._plan_mix(sources)
+    def _write_output(self, sources, path, samplerate=None):
+        samplerate, channels, length, _ = self._plan_mix(sources, samplerate)
         per_source = self.normalize and len(sources) > 1
 
         # progress over all passes: per-source peaks, mix peak, final write.
@@ -366,10 +459,10 @@ class AudioRecorder(threading.Thread):
                 peak = max((np.abs(tick(b)).max() for b in s.blocks(65536, dtype='float32')), default=0)
                 source_gains.append(1.0 / peak if peak > 0 else 1.0)
 
-        blocks = lambda: self._mixed_blocks(sources, source_gains)
+        blocks = lambda: self._mixed_blocks(sources, source_gains, samplerate=samplerate)
         if self.mono and channels > 1:
             channels = 1
-            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains))
+            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains, samplerate=samplerate))
 
         gain = 1.0
         if self.normalize:
@@ -394,6 +487,15 @@ class AudioRecorder(threading.Thread):
             with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels) as f_out:
                 for b in blocks():
                     f_out.write(tick(b, write_cost) * gain)
+
+def get_speakers():
+    """Speakers available for system-audio tracks, as id/name pairs."""
+    try:
+        return [{"id": s.id, "name": s.name} for s in sc.all_speakers()]
+    except Exception as e:
+        print(f"Error fetching speakers: {e}")
+        return []
+
 
 def get_devices(include_loopback=False):
     try:
