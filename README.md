@@ -16,6 +16,35 @@ Before opening a larger PR, please check [CONTRIBUTING.md](CONTRIBUTING.md) for 
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/lukmay/QuickAudioRecorder/pulls)
 [![Issues](https://img.shields.io/github/issues/lukmay/QuickAudioRecorder)](https://github.com/lukmay/QuickAudioRecorder/issues)
 
+### Contributors
+
+Thanks to everyone who has helped make this tool better!
+
+Code:
+
+<!-- one <td> per person, the avatar comes from github.com/<user>.png -->
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/lukmay"><img src="https://github.com/lukmay.png?size=100" width="80" alt="lukmay"><br><sub>lukmay</sub></a></td>
+    <td align="center"><a href="https://github.com/phoenixray2000"><img src="https://github.com/phoenixray2000.png?size=100" width="80" alt="phoenixray2000"><br><sub>phoenixray2000</sub></a></td>
+    <td align="center"><a href="https://github.com/Metaphizik"><img src="https://github.com/Metaphizik.png?size=100" width="80" alt="Metaphizik"><br><sub>Metaphizik</sub></a></td>
+  </tr>
+</table>
+
+Bug reports and feature ideas:
+
+<table>
+  <tr>
+    <td align="center"><a href="https://github.com/laboratoriobhost"><img src="https://github.com/laboratoriobhost.png?size=100" width="50" alt="laboratoriobhost"><br><sub>laboratoriobhost</sub></a></td>
+    <td align="center"><a href="https://github.com/ant1j"><img src="https://github.com/ant1j.png?size=100" width="50" alt="ant1j"><br><sub>ant1j</sub></a></td>
+    <td align="center"><a href="https://github.com/ColaIan"><img src="https://github.com/ColaIan.png?size=100" width="50" alt="ColaIan"><br><sub>ColaIan</sub></a></td>
+    <td align="center"><a href="https://github.com/ParanormalBanana"><img src="https://github.com/ParanormalBanana.png?size=100" width="50" alt="ParanormalBanana"><br><sub>ParanormalBanana</sub></a></td>
+    <td align="center"><a href="https://github.com/mreekie"><img src="https://github.com/mreekie.png?size=100" width="50" alt="mreekie"><br><sub>mreekie</sub></a></td>
+    <td align="center"><a href="https://github.com/rplaughl"><img src="https://github.com/rplaughl.png?size=100" width="50" alt="rplaughl"><br><sub>rplaughl</sub></a></td>
+    <td align="center"><a href="https://github.com/tragen2022"><img src="https://github.com/tragen2022.png?size=100" width="50" alt="tragen2022"><br><sub>tragen2022</sub></a></td>
+  </tr>
+</table>
+
 ## Features
 
 ### My favourite use case 💖
