@@ -91,3 +91,34 @@ def test_tracks_and_mode_survive_a_save_load_round_trip(window, tmp_path):
     reloaded = window.get_settings()
     assert reloaded["output_mode"] == "separate_files"
     assert reloaded["tracks"] == saved["tracks"]
+
+
+def test_a_track_can_target_an_application(window, monkeypatch):
+    monkeypatch.setattr(gui, "get_active_applications",
+                        lambda: [{"pid": 4242, "name": "game.exe", "title": "Game"}])
+    editor = window.track_editors()[0]
+
+    editor.kind_combo.setCurrentText(gui.TrackEditor.KIND_APP)
+    editor.refresh_devices()
+
+    assert editor.get_track() == {"kind": "application", "target_pid": 4242,
+                                  "target_name": "Game (game.exe)"}
+
+
+def test_an_application_track_survives_a_save_load_round_trip(window, tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "get_active_applications",
+                        lambda: [{"pid": 4242, "name": "game.exe", "title": "Game"}])
+    editor = window.track_editors()[0]
+    editor.kind_combo.setCurrentText(gui.TrackEditor.KIND_APP)
+    editor.refresh_devices()
+
+    saved = window.get_settings()
+    with open(os.path.join(str(tmp_path), gui.CONFIG_FILE), "w") as f:
+        json.dump(saved, f)
+
+    window.clear_tracks()
+    window.add_track()
+    window.load_settings()
+
+    assert window.get_tracks() == saved["tracks"]
+    assert window.get_tracks()[0]["kind"] == "application"

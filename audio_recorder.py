@@ -175,6 +175,140 @@ class RawRecorder(threading.Thread):
         self.stop_event.set()
         self.join()
 
+# Application capture runs through proc-tap in a child process. The capture
+# format is fixed, so these double as the recorder's rate and channel count.
+PROC_TAP_SAMPLERATE = 48000
+PROC_TAP_CHANNELS = 2
+
+
+def _pid_alive(pid):
+    """True if the target process is still running."""
+    try:
+        import psutil
+
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return True
+
+
+def _decode_message(message):
+    """Normalize a capture message to ("data", bytes) or ("error", reason, detail)."""
+    if isinstance(message, tuple) and message:
+        if message[0] == "error":
+            return ("error", message[1], message[2])
+        if message[0] == "data":
+            return ("data", message[1])
+    return ("data", message)
+
+
+def _process_tap_worker(pid, sender):
+    """Runs native application capture outside the tray process.
+
+    A fault inside the capture library would otherwise take the whole app down
+    with it, so the work happens in a spawned child.
+    """
+    capture = None
+    try:
+        import proctap
+
+        capture = proctap.ProcessAudioCapture(pid)
+        capture.start()
+        while True:
+            data = capture.read(timeout=0.1)
+            if data:
+                sender.send(("data", data))
+    except Exception as e:
+        # Report the real failure. Dying silently would look like the user's
+        # application had simply closed.
+        try:
+            reason = "failed" if _pid_alive(pid) else "closed"
+            sender.send(("error", reason, str(e) or type(e).__name__))
+        except Exception:
+            pass
+    finally:
+        if capture is not None:
+            try:
+                capture.stop()
+                capture.close()
+            except Exception:
+                pass
+
+
+class ProcTapRecorder(threading.Thread):
+    """Records one application's audio to a WAV file.
+
+    The child streams float32 buffers back over a pipe and this thread writes
+    them out, so the mixing stage opens the result like any other track.
+    """
+    samplerate = PROC_TAP_SAMPLERATE
+    channels = PROC_TAP_CHANNELS
+
+    def __init__(self, pid, filepath, name=None):
+        super().__init__()
+        self.pid = pid
+        self.filepath = filepath
+        self.device = types.SimpleNamespace(name=name or f"application {pid}")
+        self.stop_event = threading.Event()
+        self.error = None
+        self.exit_reason = None
+        self.chunks_read = 0
+        self.frames = 0
+
+    def probe(self):
+        """Matches RawRecorder's interface; the capture format is fixed."""
+
+    def run(self):
+        import multiprocessing
+
+        process = None
+        receiver = None
+        try:
+            receiver, sender = multiprocessing.Pipe(duplex=False)
+            context = multiprocessing.get_context("spawn")
+            process = context.Process(target=_process_tap_worker, args=(self.pid, sender), daemon=True)
+            process.start()
+            sender.close()
+            with sf.SoundFile(self.filepath, mode="w", samplerate=self.samplerate,
+                              channels=self.channels) as f_wav:
+                # Write silence while the app is quiet, so the track covers the
+                # same stretch of time as the other tracks.
+                silence = np.zeros((int(0.1 * self.samplerate), self.channels), dtype=np.float32)
+                while not self.stop_event.is_set():
+                    if receiver.poll(0.1):
+                        message = _decode_message(receiver.recv())
+                        if message[0] == "error":
+                            self.exit_reason = message[1]
+                            raise RuntimeError(message[2])
+                        data = np.frombuffer(message[1], dtype=np.float32).reshape(-1, self.channels)
+                        f_wav.write(data)
+                        self.frames += len(data)
+                        self.chunks_read += 1
+                    elif process is not None and not process.is_alive():
+                        if _pid_alive(self.pid):
+                            self.exit_reason = "failed"
+                            raise RuntimeError("Audio capture stopped unexpectedly.")
+                        self.exit_reason = "closed"
+                        raise RuntimeError("The application stopped or exited.")
+                    else:
+                        f_wav.write(silence)
+                        self.frames += len(silence)
+        except Exception as e:
+            self.error = str(e)
+        finally:
+            if receiver is not None:
+                try:
+                    receiver.close()
+                except Exception:
+                    pass
+            if process is not None:
+                process.terminate()
+                process.join(timeout=1.0)
+
+    def stop(self):
+        self.stop_event.set()
+        self.join()
+
+
 class AudioRecorder(threading.Thread):
     """
     Orchestrates recording from Microphone, Loopback, or Both.
@@ -248,7 +382,9 @@ class AudioRecorder(threading.Thread):
     def _get_track_device(self, track):
         if track["kind"] == TRACK_KIND_INPUT:
             return self._get_input_device(track.get("input_id"))
-        return self._get_loopback_for(track.get("speaker_id"))
+        if track["kind"] == TRACK_KIND_OUTPUT:
+            return self._get_loopback_for(track.get("speaker_id"))
+        raise ValueError("Application tracks are captured by ProcTapRecorder")
 
     def _get_device(self, is_loopback):
         """Legacy helper for the older mic/loopback mode interface."""
@@ -278,15 +414,22 @@ class AudioRecorder(threading.Thread):
                     label = "%s%d" % (label, seen[label])
                 self.track_labels.append(label)
 
-                device = self._get_track_device(track)
                 temp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 self.temp_files.append(temp_path)
-                self.recorders.append(RawRecorder(device, temp_path))
+                if track["kind"] == TRACK_KIND_APP:
+                    self.recorders.append(ProcTapRecorder(
+                        track.get("target_pid"), temp_path,
+                        name=track.get("target_name") or None))
+                else:
+                    device = self._get_track_device(track)
+                    self.recorders.append(RawRecorder(device, temp_path))
 
             # Probe before starting so both sources start close together.
             # The loopback gets asked for the mic's rate first, so mixing
             # rarely has to resample.
             for r in self.recorders:
+                if isinstance(r, ProcTapRecorder):
+                    continue  # application capture has a fixed format
                 if r is not self.recorders[0]:
                     r.samplerate = self.recorders[0].samplerate
                 try:
@@ -324,14 +467,28 @@ class AudioRecorder(threading.Thread):
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-            sources = [sf.SoundFile(t) for t in self.temp_files]
+            # A track that captured nothing usable - a failed application
+            # capture, for instance - must not cost us the tracks that worked.
+            usable = []
+            for temp_path, label in zip(self.temp_files, self.track_labels):
+                try:
+                    if os.path.getsize(temp_path) > 0:
+                        usable.append((sf.SoundFile(temp_path), label))
+                except Exception:
+                    continue
+            if not usable:
+                raise Exception("No audio was captured from any track")
+
+            sources = [source for source, _ in usable]
+            labels = [label for _, label in usable]
+
             try:
                 if self.output_mode == "separate_files" and len(sources) > 1:
                     # Keep one file per track, all at the shared mix rate so
                     # they describe the same span and can be re-mixed later.
                     mix_rate = self._plan_mix(sources)[0]
                     self.final_filepaths = []
-                    for source, label in zip(sources, self.track_labels):
+                    for source, label in zip(sources, labels):
                         path = os.path.join(
                             self.output_folder,
                             f"Recording_{timestamp}_{label}.{self.output_format}")

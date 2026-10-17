@@ -13,6 +13,7 @@ from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent,
 import soundcard as sc
 import keyboard
 from audio_recorder import AudioRecorder, get_devices, get_speakers
+from process_utils import get_active_applications
 from clipboard_utils import copy_file_to_clipboard
 
 CONFIG_FILE = "settings.json"
@@ -109,6 +110,7 @@ class TrackEditor(QWidget):
 
     KIND_INPUT = "Input Device"
     KIND_OUTPUT = "Output (System Audio)"
+    KIND_APP = "Application"
 
     removed = pyqtSignal(object)
 
@@ -120,7 +122,7 @@ class TrackEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.kind_combo = QComboBox()
-        self.kind_combo.addItems([self.KIND_INPUT, self.KIND_OUTPUT])
+        self.kind_combo.addItems([self.KIND_INPUT, self.KIND_OUTPUT, self.KIND_APP])
         self.kind_combo.currentIndexChanged.connect(self.on_kind_changed)
         layout.addWidget(self.kind_combo, 2)
 
@@ -132,7 +134,12 @@ class TrackEditor(QWidget):
         layout.addWidget(btn_remove)
 
     def current_kind(self):
-        return "output" if self.kind_combo.currentText() == self.KIND_OUTPUT else "input"
+        text = self.kind_combo.currentText()
+        if text == self.KIND_OUTPUT:
+            return "output"
+        if text == self.KIND_APP:
+            return "application"
+        return "input"
 
     def on_kind_changed(self, _index=None):
         if not self._loading:
@@ -143,7 +150,13 @@ class TrackEditor(QWidget):
         self._loading = True
         try:
             self.device_combo.clear()
-            if self.current_kind() == "input":
+            kind = self.current_kind()
+            if kind == "application":
+                # Applications come and go, so this list is always fetched fresh.
+                for app in get_active_applications():
+                    self.device_combo.addItem(f"{app['title']} ({app['name']})", app["pid"])
+                return
+            if kind == "input":
                 for device in get_devices(include_loopback=False):
                     self.device_combo.addItem(device["name"], device["id"])
                 default_id = sc.default_microphone().id
@@ -160,17 +173,28 @@ class TrackEditor(QWidget):
             self._loading = False
 
     def get_track(self):
-        if self.current_kind() == "input":
+        kind = self.current_kind()
+        if kind == "input":
             return {"kind": "input", "input_id": self.device_combo.currentData()}
-        return {"kind": "output", "speaker_id": self.device_combo.currentData()}
+        if kind == "output":
+            return {"kind": "output", "speaker_id": self.device_combo.currentData()}
+        return {"kind": "application",
+                "target_pid": self.device_combo.currentData(),
+                "target_name": self.device_combo.currentText()}
 
     def set_track(self, track):
         kind = str(track.get("kind") or "input").strip().lower()
+        label = {"output": self.KIND_OUTPUT, "application": self.KIND_APP}.get(kind, self.KIND_INPUT)
         self._loading = True
-        self.kind_combo.setCurrentText(self.KIND_OUTPUT if kind == "output" else self.KIND_INPUT)
+        self.kind_combo.setCurrentText(label)
         self._loading = False
         self.refresh_devices()
-        wanted = track.get("speaker_id") if kind == "output" else track.get("input_id")
+        if kind == "output":
+            wanted = track.get("speaker_id")
+        elif kind == "application":
+            wanted = track.get("target_pid")
+        else:
+            wanted = track.get("input_id")
         if wanted is not None:
             index = self.device_combo.findData(wanted)
             if index >= 0:
