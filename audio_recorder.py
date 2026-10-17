@@ -70,6 +70,7 @@ class RawRecorder(threading.Thread):
         self.channels = channels
         self.stop_event = threading.Event()
         self.error = None
+        self.frames = 0  # written so far, kept if the device is lost midway
 
     def _probe_params(self):
         """Find working (samplerate, channels) for this device."""
@@ -114,8 +115,10 @@ class RawRecorder(threading.Thread):
                     while not self.stop_event.is_set():
                         data = mic.record(numframes=2048)
                         f_wav.write(data)
+                        self.frames += len(data)
         except Exception as e:
-            self.error = str(e)
+            # an unplugged device ends up here, the WAV keeps what was written
+            self.error = str(e) or type(e).__name__
 
     def stop(self):
         self.stop_event.set()
@@ -126,7 +129,8 @@ class AudioRecorder(threading.Thread):
     Orchestrates recording from Microphone, Loopback, or Both.
     """
     def __init__(self, mic_id, source_mode, output_folder, output_format="mp3", 
-                 normalize=False, mono=False, on_finish_callback=None, on_progress=None):
+                 normalize=False, mono=False, on_finish_callback=None, on_progress=None,
+                 on_notice=None):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
@@ -136,6 +140,7 @@ class AudioRecorder(threading.Thread):
         self.mono = mono
         self.callback = on_finish_callback
         self.on_progress = on_progress  # called with 0..1 while saving
+        self.on_notice = on_notice  # called with a message if a device is lost
         
         self.recording = False
         self.stop_event = threading.Event()
@@ -219,16 +224,23 @@ class AudioRecorder(threading.Thread):
             for r in self.recorders:
                 r.start()
             
-            # Wait for stop signal
-            self.stop_event.wait()
-            
-            # 3. Stop Recording
+            # 3. Wait for the stop signal. A recorder only ends on its own when
+            # its device is lost, then stop and save what was captured so far.
+            while not self.stop_event.wait(0.5):
+                lost = next((r for r in self.recorders if not r.is_alive()), None)
+                if lost:
+                    if self.on_notice:
+                        self.on_notice(f"Lost '{lost.device.name}', saving recording...")
+                    self.stop_event.set()
+
+            # 4. Stop Recording. Fails only if nothing was captured at all.
             for r in self.recorders:
                 r.stop()
-                if r.error:
-                    raise Exception(f"Recording failed on '{r.device.name}': {r.error}")
+            failed = next((r for r in self.recorders if r.error), None)
+            if failed and not any(r.frames for r in self.recorders):
+                raise Exception(f"Recording failed on '{failed.device.name}': {failed.error}")
 
-            # 4. Mix, normalize and encode block by block. Loading a long
+            # 5. Mix, normalize and encode block by block. Loading a long
             # recording at once needs several GB of RAM (see #7).
             if not os.path.exists(self.output_folder):
                 os.makedirs(self.output_folder)
@@ -243,6 +255,10 @@ class AudioRecorder(threading.Thread):
             finally:
                 for s in sources:
                     s.close()
+
+            # saved, but shorter than asked for: the GUI keeps the file and warns
+            if failed:
+                self.error_message = f"Recording on '{failed.device.name}' stopped early: {failed.error}"
 
         except Exception as e:
             self.error_message = str(e)

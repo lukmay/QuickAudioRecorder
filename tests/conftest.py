@@ -28,6 +28,8 @@ class FakeStream:
         return False
 
     def record(self, numframes):
+        if self.device.die_after is not None and self.pos >= self.device.die_after:
+            raise RuntimeError("device lost")
         # pace like a real device so a recording thread doesn't spin
         time.sleep(numframes / self.samplerate / self.device.speed)
         t = (np.arange(numframes) + self.pos) / self.samplerate
@@ -40,7 +42,8 @@ class FakeDevice:
     """Stands in for a soundcard microphone / loopback device."""
 
     def __init__(self, name, freq=440.0, amplitude=0.5, channels=2,
-                 isloopback=False, speed=20.0, fail_with=None, rates=None):
+                 isloopback=False, speed=20.0, fail_with=None, rates=None,
+                 die_after=None):
         self.name = name
         self.id = name
         self.freq = freq
@@ -50,6 +53,7 @@ class FakeDevice:
         self.speed = speed
         self.fail_with = fail_with
         self.rates = rates
+        self.die_after = die_after  # frames recorded before it gets unplugged
 
     def recorder(self, samplerate, channels=None, blocksize=None):
         if self.rates is not None and samplerate not in self.rates:

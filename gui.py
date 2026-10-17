@@ -29,6 +29,7 @@ class SignalManager(QObject):
     saving = pyqtSignal()
     progress = pyqtSignal(float)
     hotkey = pyqtSignal(str)
+    recording_notice = pyqtSignal(str)  # device lost while recording
 
 class HotkeyEdit(QLineEdit):
     """
@@ -299,6 +300,7 @@ class TrayApplication(QObject):
         self.signals.progress.connect(self.on_save_progress)
         self.save_percent = -1
         self.signals.hotkey.connect(self.on_hotkey)
+        self.signals.recording_notice.connect(self.on_recording_notice)
 
         # ticks while recording: elapsed time in the tooltip, auto stop
         self.rec_timer = QTimer(self)
@@ -435,7 +437,8 @@ class TrayApplication(QObject):
             normalize=settings['normalize'],
             mono=settings['mono'],
             on_finish_callback=finish_callback,
-            on_progress=self.signals.progress.emit
+            on_progress=self.signals.progress.emit,
+            on_notice=self.signals.recording_notice.emit
         )
         self.recorder.start()
         self.action_record_mic.setEnabled(False)
@@ -496,6 +499,11 @@ class TrayApplication(QObject):
         painter.end()
         return QIcon(pix)
 
+    def on_recording_notice(self, message):
+        # the recorder stopped itself, shown even with notifications off
+        self.tray_icon.showMessage("Recording", message, QSystemTrayIcon.MessageIcon.Warning, 3000)
+        self.on_saving()
+
     def on_recording_finished(self, path, error):
         self.rec_timer.stop()
         self.action_record_mic.setEnabled(True)
@@ -507,13 +515,16 @@ class TrayApplication(QObject):
         self.tray_icon.setToolTip("Simple Audio Recorder (Idle)")
         self.recorder = None
         
-        if error:
+        # a partial recording comes back with a path and an error, keep it and warn
+        if error and not (path and os.path.exists(path)):
             self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
             return
             
         settings = self.settings_window.get_settings()
         final_path = path
         msg = f"Saved to {os.path.basename(path)}"
+        if error:
+            msg += f"\nWarning: {error}"
         
         if settings['clipboard'] and os.path.exists(path):
             try:
