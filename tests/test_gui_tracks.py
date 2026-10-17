@@ -122,3 +122,76 @@ def test_an_application_track_survives_a_save_load_round_trip(window, tmp_path, 
 
     assert window.get_tracks() == saved["tracks"]
     assert window.get_tracks()[0]["kind"] == "application"
+
+
+def test_choose_app_is_enabled_only_for_application_tracks(window):
+    editor = window.track_editors()[0]
+
+    assert editor.app_btn.isEnabled() is False
+
+    editor.kind_combo.setCurrentText(gui.TrackEditor.KIND_APP)
+    editor.refresh_devices()
+
+    assert editor.app_btn.isEnabled() is True
+
+
+def test_choosing_an_application_adopts_it_on_the_row(window, monkeypatch):
+    class StubPicker:
+        selected_pid = 4242
+        selected_hwnd = 99
+        selected_title = "Game"
+        selected_name = "game.exe"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return gui.QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(gui, "AppPickerDialog", StubPicker)
+    editor = window.track_editors()[0]
+
+    editor.open_app_picker()
+
+    assert editor.get_track() == {"kind": "application", "target_pid": 4242,
+                                  "target_name": "Game (game.exe)"}
+
+
+def test_a_cancelled_picker_changes_nothing(window, monkeypatch):
+    class CancelledPicker:
+        selected_pid = None
+        selected_hwnd = None
+        selected_title = None
+        selected_name = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return gui.QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(gui, "AppPickerDialog", CancelledPicker)
+    editor = window.track_editors()[0]
+    before = editor.get_track()
+
+    editor.open_app_picker()
+
+    assert editor.get_track() == before
+
+
+def test_hotkeys_are_one_record_one_toggle_and_stop(window):
+    settings = window.get_settings()
+
+    for key in ("hk_record", "hk_toggle", "hk_stop"):
+        assert key in settings
+    for gone in ("hk_mic", "hk_loop", "hk_both"):
+        assert gone not in settings
+
+
+def test_an_old_per_mode_hotkey_becomes_the_record_hotkey(window, tmp_path):
+    with open(os.path.join(str(tmp_path), gui.CONFIG_FILE), "w") as f:
+        json.dump({"hk_both": "ctrl+shift+r", "hk_mic": "ctrl+m"}, f)
+
+    window.load_settings()
+
+    assert window.hk_record.text() == "ctrl+shift+r"

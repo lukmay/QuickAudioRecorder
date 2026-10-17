@@ -1,19 +1,24 @@
+import ctypes
 import sys
 import os
 import json
 import shutil
 import tempfile
 import time
+from ctypes import wintypes
+
+import psutil
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow, 
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
                              QPushButton, QFileDialog, QMessageBox, QGroupBox, 
-                             QLineEdit, QFormLayout, QCheckBox, QSpinBox, QScrollArea)
-from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent, QTimer
+                             QLineEdit, QFormLayout, QCheckBox, QSpinBox, QScrollArea,
+                             QDialog, QListWidget, QListWidgetItem)
+from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence, QImage
+from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent, QTimer, QPoint, QSize
 import soundcard as sc
 import keyboard
 from audio_recorder import AudioRecorder, get_devices, get_speakers
-from process_utils import get_active_applications
+from process_utils import get_active_applications, get_foreground_window_info
 from clipboard_utils import copy_file_to_clipboard
 
 CONFIG_FILE = "settings.json"
@@ -105,6 +110,622 @@ class HotkeyEdit(QLineEdit):
         self.current_sequence = final_hotkey
         self.clearFocus()
 
+def window_thumbnail(hwnd, width=48, height=32):
+    """Capture a small screenshot of the given window as a QIcon.
+
+    Mirrors how OBS captures windows: the primary method is a GDI ``BitBlt`` of
+    the window's own device context (captures the real window, never the
+    desktop, with no cropping or overlap). A desktop-DC crop at the window's
+    exact rectangle is used only as a fallback for windows where that BitBlt
+    comes back blank (e.g. GPU-composited content). Returns None when the window
+    can't be captured.
+    """
+    if not hwnd:
+        return None
+    # PrintWindow with PW_RENDERFULLCONTENT is the OBS "Windows 10" capture
+    # method: it asks the target to paint its full content (including GPU
+    # composited clients like Chrome/Vivaldi/Discord) into our DC, so it captures
+    # the real window -- never the desktop -- with no cropping or overlap, and
+    # works while the window is behind others. This is prioritized over BitBlt,
+    # which returns a blank bitmap for most modern windows.
+    image = _printwindow_image(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    image = _bitblt_window_image(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    image = _bitblt_desktop_rect(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    return None
+
+
+def _is_good_image(image):
+    """True when ``image`` is a usable, non-blank capture."""
+    return image is not None and not image.isNull() and not _is_uniform_image(image)
+
+
+def _bitblt_window_image(hwnd, width, height):
+    """Capture ``hwnd`` by BitBlt-ing its window device context.
+
+    This is the OBS-proven GDI method: ``GetWindowDC`` + ``BitBlt`` of the
+    window's own content into a memory bitmap, converted to a ``QImage``. It
+    captures the actual window (never the desktop) and works across monitors.
+
+    Returns None on any failure so callers fall back to the desktop-DC crop.
+    """
+    try:
+        import win32con
+        import win32gui
+        import win32ui
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), win32con.SRCCOPY)
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+def _printwindow_image(hwnd, width, height):
+    """Capture ``hwnd`` with ``PrintWindow`` (PW_RENDERFULLCONTENT).
+
+    This is the technique OBS and Chromium use for windows where a GDI
+    ``BitBlt`` hands back a blank bitmap -- GPU-composited clients (Chrome,
+    Discord, Vivaldi), occluded, or minimized windows. ``PrintWindow`` asks the
+    target to paint its full content (including the client area) into our memory
+    DC, so it captures the real window and not the desktop, with no cropping or
+    overlap, and works even when the window is behind others.
+
+    pywin32 does not expose ``PrintWindow``, so we call ``user32.PrintWindow``
+    directly via ctypes.
+
+    Returns None on any failure.
+    """
+    hwnd = int(hwnd)
+    try:
+        import ctypes
+
+        import win32gui
+        import win32ui
+
+        user32 = ctypes.windll.user32
+        user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        user32.PrintWindow.restype = ctypes.c_int
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            dest = int(save_dc.GetSafeHdc())
+            # PW_RENDERFULLCONTENT (2) asks the app to render its full client
+            # area; fall back to the plain (0) variant if it is unsupported.
+            if not user32.PrintWindow(hwnd, dest, 2) and not user32.PrintWindow(
+                hwnd, dest, 0
+            ):
+                return None
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+def _is_uniform_image(image):
+    """Return True when ``image`` is blank (a single solid colour).
+
+    PrintWindow frequently hands back an all-black or all-white bitmap for
+    GPU-composited windows; such a result should be discarded in favour of a
+    screen grab.
+    """
+    if image is None or image.isNull():
+        return True
+    try:
+        converted = image.convertToFormat(QImage.Format.Format_RGB32)
+    except Exception:
+        return True
+    width = converted.width()
+    height = converted.height()
+    if width == 0 or height == 0:
+        return True
+    first = converted.pixelColor(0, 0)
+    target = (first.red(), first.green(), first.blue())
+    for y in range(height):
+        for x in range(width):
+            color = converted.pixelColor(x, y)
+            if (color.red(), color.green(), color.blue()) != target:
+                return False
+    return True
+
+
+def _bitblt_desktop_rect(hwnd, width, height):
+    """Fallback capture: BitBlt the desktop DC at the window's exact rect.
+
+    When a direct ``BitBlt`` of the window's own DC comes back blank (GPU
+    composited windows, etc.) the desktop device context still holds the
+    composited result for the region the window occupies, so sampling that
+    region recovers the content. The crop is the window's real rectangle, so it
+    is accurate with no overlap or guesswork.
+
+    Returns None on any failure.
+    """
+    try:
+        import win32con
+        import win32gui
+        import win32ui
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        left, top = rect[0], rect[1]
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        desktop_dc = win32gui.GetDC(0)
+        if not desktop_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(desktop_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (left, top), win32con.SRCCOPY)
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(0, desktop_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+
+# source window straight onto our dialog. That removes the per-second
+# PrintWindow/BitBlt capture that made the picker laggy. The struct layout
+# below mirrors the native DWM_THUMBNAIL_PROPERTIES (DWORD, RECT, RECT, BYTE,
+# BOOL, BOOL) so ctypes packs it correctly.
+try:
+    _dwmapi = ctypes.windll.dwmapi
+    _DWM_AVAILABLE = True
+except Exception:
+    _dwmapi = None
+    _DWM_AVAILABLE = False
+
+
+class _DwmRect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _DwmThumbnailProps(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", ctypes.c_uint32),
+        ("rcDestination", _DwmRect),
+        ("rcSource", _DwmRect),
+        ("opacity", ctypes.c_byte),
+        ("fVisible", ctypes.c_bool),
+        ("fSourceClientAreaOnly", ctypes.c_bool),
+    ]
+
+
+
+class AppPickerDialog(QDialog):
+    THUMBNAIL_SIZE = (240, 150)
+
+    def __init__(self, parent=None, recency=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Application to Capture")
+        self.setMinimumSize(360, 460)
+        self.resize(1000, 560)
+        self.setWindowIcon(QIcon(resource_path("icon_rec.png")))
+        self._recency = recency or {}
+        self._loading = True
+        self.selected_pid = None
+        self.selected_hwnd = None
+        self.selected_title = ""
+        self.selected_name = ""
+
+        # Incremental state so refreshes never rebuild the whole list.
+        self._item_map = {}  # (pid, hwnd) -> QListWidgetItem
+        self._thumb_map = {}  # (pid, hwnd) -> DWM thumbnail handle
+        self._preview_map = {}  # (pid, hwnd) -> preview QLabel
+        self._static_times = {}  # (pid, hwnd) -> last static-capture time
+
+        layout = QVBoxLayout(self)
+        self.list = QListWidget()
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setMovement(QListWidget.Movement.Static)
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setSpacing(10)
+        self.list.setWordWrap(True)
+        self.list.setIconSize(QSize(*self.THUMBNAIL_SIZE))
+        self.list.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self.list, 1)
+
+        hint = QLabel("Click a window to capture it. Close this window to cancel.")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(hint)
+
+        self._populate()
+        self._loading = False
+
+        # Re-enumerate running applications once per second so newly opened or
+        # closed windows surface without rebuilding the widget list.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1000)
+        self._refresh_timer.timeout.connect(self._populate)
+        self._refresh_timer.start()
+
+        # Live DWM thumbnails are cheap to reposition, so refresh their geometry
+        # frequently. Static (PrintWindow) fallbacks are throttled separately.
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(100)
+        self._live_timer.timeout.connect(self._update_live_thumbnails)
+        self._live_timer.start()
+
+        self._static_timer = QTimer(self)
+        self._static_timer.setInterval(1500)
+        self._static_timer.timeout.connect(self._refresh_static_visible)
+        self._static_timer.start()
+
+    def _populate(self):
+        try:
+            apps = get_active_applications()
+        except Exception:
+            apps = []
+        apps = self._sort_apps(apps)
+
+        current = self.list.currentItem()
+        selected_key = current.data(Qt.ItemDataRole.UserRole) if current else None
+
+        seen = set()
+        for app in apps:
+            key = (app.get("pid"), app.get("hwnd"))
+            seen.add(key)
+            title = app.get("title", "")
+            name = app.get("name", "")
+            text = f"{title}\n{name}" if title else name
+            item = self._item_map.get(key)
+            if item is None:
+                item = QListWidgetItem()
+                item.setSizeHint(
+                    QSize(self.THUMBNAIL_SIZE[0] + 16, self.THUMBNAIL_SIZE[1] + 44)
+                )
+                item.setData(Qt.ItemDataRole.UserRole, app.get("pid"))
+                item.setData(Qt.ItemDataRole.UserRole + 1, app.get("hwnd"))
+                self.list.addItem(item)
+                widget = self._make_item_widget(key, text)
+                self.list.setItemWidget(item, widget)
+                self._item_map[key] = item
+                self._preview_map[key] = widget.findChild(QLabel, "preview")
+                if _DWM_AVAILABLE:
+                    self._register_thumb(key, app.get("hwnd"))
+            else:
+                item.setText(text)
+                widget = self.list.itemWidget(item)
+                if widget is not None:
+                    label = widget.findChild(QLabel, "label")
+                    if label is not None:
+                        label.setText(text)
+            if key == selected_key:
+                self.list.setCurrentItem(item)
+
+        # Drop windows that disappeared since the last refresh.
+        for key in list(self._item_map):
+            if key not in seen:
+                item = self._item_map.pop(key)
+                self._unregister_thumb(key)
+                self._preview_map.pop(key, None)
+                self._static_times.pop(key, None)
+                row = self.list.row(item)
+                if row >= 0:
+                    self.list.takeItem(row)
+
+    def _sort_apps(self, apps):
+        # The foreground window is the most recently interacted app; boost it so
+        # it floats to the top. The picker itself becomes foreground when shown,
+        # so ignore our own window handle.
+        fg_hwnd, fg_pid = get_foreground_window_info()
+        own_hwnd = int(self.winId()) if self.winId() else 0
+        if fg_hwnd == own_hwnd:
+            fg_pid = None
+        for app in apps:
+            app["_fg"] = 1 if app.get("pid") == fg_pid else 0
+
+        groups = {}
+        for app in apps:
+            groups.setdefault(app.get("name", ""), []).append(app)
+
+        # Order each executable group by the most-recently-interacted window it
+        # contains (falling back to process creation time). Then interleave the
+        # groups round-robin so windows belonging to the same executable are not
+        # listed consecutively.
+        def group_key(items):
+            return (
+                max(a["_fg"] for a in items),
+                max(self._recency.get(a.get("pid"), 0.0) for a in items),
+                max(a.get("create_time", 0.0) for a in items),
+            )
+
+        ordered = sorted(groups.values(), key=group_key, reverse=True)
+        queues = [list(group) for group in ordered if group]
+        result = []
+        while queues:
+            next_round = []
+            for queue in queues:
+                result.append(queue.pop(0))
+                if queue:
+                    next_round.append(queue)
+            queues = next_round
+        return result
+
+    def _make_item_widget(self, key, text):
+        container = QWidget()
+        container.setFixedSize(self.THUMBNAIL_SIZE[0] + 16, self.THUMBNAIL_SIZE[1] + 44)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(4, 4, 4, 4)
+        preview = QLabel()
+        preview.setObjectName("preview")
+        preview.setFixedSize(*self.THUMBNAIL_SIZE)
+        # Transparent so the OS-composited DWM live thumbnail shows through;
+        # when DWM is unavailable we paint a captured pixmap here instead.
+        preview.setStyleSheet("background:transparent; border:1px solid #555;")
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label = QLabel(text)
+        label.setObjectName("label")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        layout.addWidget(preview)
+        layout.addWidget(label)
+
+        def _press(event):
+            self._select(key)
+
+        container.mousePressEvent = _press
+        preview.mousePressEvent = _press
+        label.mousePressEvent = _press
+        return container
+
+    def _on_item_clicked(self, item):
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        hwnd = item.data(Qt.ItemDataRole.UserRole + 1)
+        self._select((pid, hwnd))
+
+    def _select(self, key, item=None):
+        if self._loading:
+            return
+        if item is None:
+            item = self._item_map.get(key)
+        if item is None:
+            return
+        self.list.setCurrentItem(item)
+        app_pid, app_hwnd = key
+        self.selected_pid = app_pid
+        self.selected_hwnd = app_hwnd
+        text = item.text().split("\n")
+        self.selected_title = text[0] if len(text) > 1 else ""
+        self.selected_name = text[-1]
+        self.accept()
+
+    # ── Live DWM thumbnails ──────────────────────────────────────────────────
+
+    def _register_thumb(self, key, hwnd):
+        if hwnd is None or not _DWM_AVAILABLE:
+            return
+        try:
+            handle = ctypes.c_void_p()
+            hr = _dwmapi.DwmRegisterThumbnail(
+                ctypes.c_void_p(int(self.winId())),
+                ctypes.c_void_p(int(hwnd)),
+                ctypes.byref(handle),
+            )
+            if hr == 0 and handle.value:
+                self._thumb_map[key] = handle.value
+        except Exception:
+            pass
+
+    def _unregister_thumb(self, key):
+        handle = self._thumb_map.pop(key, None)
+        if handle is None or not _DWM_AVAILABLE:
+            return
+        try:
+            _dwmapi.DwmUnregisterThumbnail(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+
+    def _update_live_thumbnails(self):
+        if not _DWM_AVAILABLE:
+            return
+        for key, item in list(self._item_map.items()):
+            preview = self._preview_map.get(key)
+            if preview is None or not preview.isVisible():
+                continue
+            handle = self._thumb_map.get(key)
+            if handle is None:
+                self._register_thumb(key, key[1])
+                handle = self._thumb_map.get(key)
+            if handle is None:
+                self._static_fallback(key, preview)
+                continue
+            top = preview.mapTo(self, QPoint(0, 0))
+            props = _DwmThumbnailProps()
+            props.dwFlags = (
+                _DWM_TNP_RECTDESTINATION
+                | _DWM_TNP_VISIBLE
+                | _DWM_TNP_SOURCECLIENTAREAONLY
+                | _DWM_TNP_OPACITY
+            )
+            props.rcDestination.left = top.x()
+            props.rcDestination.top = top.y()
+            props.rcDestination.right = top.x() + preview.width()
+            props.rcDestination.bottom = top.y() + preview.height()
+            props.opacity = 255
+            props.fVisible = True
+            props.fSourceClientAreaOnly = True
+            try:
+                _dwmapi.DwmUpdateThumbnailProperties(
+                    ctypes.c_void_p(handle), ctypes.byref(props)
+                )
+            except Exception:
+                self._unregister_thumb(key)
+                self._static_fallback(key, preview)
+
+    def _refresh_static_visible(self):
+        for key, item in list(self._item_map.items()):
+            if key in self._thumb_map:
+                continue
+            preview = self._preview_map.get(key)
+            if preview is None or not preview.isVisible():
+                continue
+            self._static_fallback(key, preview)
+
+    def _static_fallback(self, key, preview):
+        now = time.time()
+        last = self._static_times.get(key, 0.0)
+        if now - last < 1.5:
+            return
+        self._static_times[key] = now
+        icon = window_thumbnail(key[1], *self.THUMBNAIL_SIZE)
+        if icon is not None:
+            preview.setPixmap(icon.pixmap(*self.THUMBNAIL_SIZE))
+
+    def _cleanup(self):
+        self._refresh_timer.stop()
+        self._live_timer.stop()
+        self._static_timer.stop()
+        for key in list(self._thumb_map):
+            self._unregister_thumb(key)
+
+    def accept(self):
+        self._cleanup()
+        super().accept()
+
+    def reject(self):
+        self._cleanup()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._cleanup()
+        super().closeEvent(event)
+
+
+
+
 class TrackEditor(QWidget):
     """One row of the track list: which source this track captures."""
 
@@ -129,6 +750,11 @@ class TrackEditor(QWidget):
         self.device_combo = QComboBox()
         layout.addWidget(self.device_combo, 3)
 
+        self.app_btn = QPushButton("Choose App...")
+        self.app_btn.setToolTip("Capture one application's audio")
+        self.app_btn.clicked.connect(self.open_app_picker)
+        layout.addWidget(self.app_btn)
+
         btn_remove = QPushButton("Remove")
         btn_remove.clicked.connect(lambda: self.removed.emit(self))
         layout.addWidget(btn_remove)
@@ -147,6 +773,7 @@ class TrackEditor(QWidget):
 
     def refresh_devices(self):
         """Fills the device list for the selected kind."""
+        self.app_btn.setEnabled(self.current_kind() == "application")
         self._loading = True
         try:
             self.device_combo.clear()
@@ -154,7 +781,7 @@ class TrackEditor(QWidget):
             if kind == "application":
                 # Applications come and go, so this list is always fetched fresh.
                 for app in get_active_applications():
-                    self.device_combo.addItem(f"{app['title']} ({app['name']})", app["pid"])
+                    self.device_combo.addItem(self.app_text(app["title"], app["name"]), app["pid"])
                 return
             if kind == "input":
                 for device in get_devices(include_loopback=False):
@@ -171,6 +798,37 @@ class TrackEditor(QWidget):
             print(f"Error refreshing devices: {e}")
         finally:
             self._loading = False
+
+    @staticmethod
+    def app_text(title, name):
+        title, name = (title or "").strip(), (name or "").strip()
+        if title and name:
+            return f"{title} ({name})"
+        return title or name or "Unknown application"
+
+    def open_app_picker(self):
+        """Opens the application picker and adopts the chosen application."""
+        recency = getattr(self.parent(), "_app_recency", {}) or {}
+        dialog = AppPickerDialog(self, recency=recency)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_pid is not None:
+            self.set_app(dialog.selected_pid, dialog.selected_hwnd,
+                         dialog.selected_title, dialog.selected_name)
+
+    def set_app(self, pid, hwnd, title, name):
+        """Records the picked application and shows it on this row."""
+        if self.kind_combo.currentText() != self.KIND_APP:
+            self._loading = True
+            self.kind_combo.setCurrentText(self.KIND_APP)
+            self._loading = False
+            self.refresh_devices()
+        label = self.app_text(title, name)
+        index = self.device_combo.findData(pid)
+        if index < 0:
+            self.device_combo.addItem(label, pid)
+            index = self.device_combo.count() - 1
+        else:
+            self.device_combo.setItemText(index, label)
+        self.device_combo.setCurrentIndex(index)
 
     def get_track(self):
         kind = self.current_kind()
@@ -298,14 +956,12 @@ class SettingsWindow(QMainWindow):
         # Hotkeys
         group_hotkeys = QGroupBox("Global Hotkeys")
         layout_hotkeys = QFormLayout()
-        self.hk_mic = HotkeyEdit()
-        self.hk_loop = HotkeyEdit()
-        self.hk_both = HotkeyEdit()
+        self.hk_record = HotkeyEdit()
+        self.hk_toggle = HotkeyEdit()
         self.hk_stop = HotkeyEdit()
-        layout_hotkeys.addRow("Record Mic:", self.hk_mic)
-        layout_hotkeys.addRow("Record Loopback:", self.hk_loop)
-        layout_hotkeys.addRow("Record Both:", self.hk_both)
+        layout_hotkeys.addRow("Start Recording:", self.hk_record)
         layout_hotkeys.addRow("Stop Recording:", self.hk_stop)
+        layout_hotkeys.addRow("Toggle Recording:", self.hk_toggle)
         group_hotkeys.setLayout(layout_hotkeys)
         layout.addWidget(group_hotkeys)
 
@@ -387,9 +1043,11 @@ class SettingsWindow(QMainWindow):
                 self.chk_delete.setChecked(data.get("delete_after", False))
                 self.chk_delete.setEnabled(self.chk_clipboard.isChecked())
 
-                self.hk_mic.setText(data.get("hk_mic", ""))
-                self.hk_loop.setText(data.get("hk_loop", ""))
-                self.hk_both.setText(data.get("hk_both", ""))
+                # an older settings file could hold three per-mode hotkeys;
+                # keep the most useful one as the single record hotkey
+                self.hk_record.setText(data.get("hk_record",
+                                               data.get("hk_both") or data.get("hk_mic") or ""))
+                self.hk_toggle.setText(data.get("hk_toggle", ""))
                 self.hk_stop.setText(data.get("hk_stop", ""))
             except Exception as e:
                 print(f"Error loading settings: {e}")
@@ -419,9 +1077,8 @@ class SettingsWindow(QMainWindow):
             "normalize": self.chk_normalize.isChecked(),
             "clipboard": self.chk_clipboard.isChecked(),
             "delete_after": self.chk_delete.isChecked(),
-            "hk_mic": self.hk_mic.text(),
-            "hk_loop": self.hk_loop.text(),
-            "hk_both": self.hk_both.text(),
+            "hk_record": self.hk_record.text(),
+            "hk_toggle": self.hk_toggle.text(),
             "hk_stop": self.hk_stop.text()
         }
 
@@ -511,24 +1168,23 @@ class TrayApplication(QObject):
         try: keyboard.unhook_all_hotkeys() # Ensure no old hotkeys are active
         except: pass
         settings = self.settings_window.get_settings()
-        hk_mic = settings.get("hk_mic")
-        hk_loop = settings.get("hk_loop")
-        hk_both = settings.get("hk_both")
+        hk_record = settings.get("hk_record")
+        hk_toggle = settings.get("hk_toggle")
         hk_stop = settings.get("hk_stop")
         try:
             # keyboard runs callbacks on its own thread, hand them to the Qt thread
-            if hk_mic: keyboard.add_hotkey(hk_mic, lambda: self.signals.hotkey.emit("mic"))
-            if hk_loop: keyboard.add_hotkey(hk_loop, lambda: self.signals.hotkey.emit("loopback"))
-            if hk_both: keyboard.add_hotkey(hk_both, lambda: self.signals.hotkey.emit("both"))
+            if hk_record: keyboard.add_hotkey(hk_record, lambda: self.signals.hotkey.emit("record"))
+            if hk_toggle: keyboard.add_hotkey(hk_toggle, lambda: self.signals.hotkey.emit("toggle"))
             if hk_stop: keyboard.add_hotkey(hk_stop, lambda: self.signals.hotkey.emit("stop"))
         except Exception as e: print(f"Failed to register hotkeys: {e}")
 
-    def on_hotkey(self, mode):
-        # a record hotkey pressed again stops the recording
-        if mode == "stop" or (self.recorder and self.recorder.is_alive()):
+    def on_hotkey(self, action):
+        # "toggle" flips recording, "record" only starts, "stop" only stops
+        recording = bool(self.recorder and self.recorder.is_alive())
+        if action == "stop" or (action == "toggle" and recording):
             self.stop_recording()
-        else:
-            self.start_recording(mode)
+        elif action in ("record", "toggle"):
+            self.start_recording()
 
     def notify(self, title, msg, icon=QSystemTrayIcon.MessageIcon.Information, ms=2000):
         if self.settings_window.chk_notifications.isChecked():

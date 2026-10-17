@@ -85,3 +85,26 @@ def get_active_applications():
 
     win32gui.EnumWindows(visit, None)
     return sorted(windows.values(), key=lambda app: app["title"].casefold())
+
+
+def get_foreground_window_info():
+    """Return (hwnd, pid) of the foreground window using user32 directly.
+
+    ctypes is preferred here over the win32 wrappers because it reads the live
+    foreground state at call time, which makes window ordering ("most recently
+    interacted with") accurate even between the recency timer's ticks. Returns
+    (0, None) when nothing is foregrounded or the call fails.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return (0, None)
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return (hwnd, pid.value)
+    except Exception:
+        return (0, None)

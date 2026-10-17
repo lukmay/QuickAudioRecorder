@@ -57,17 +57,17 @@ def test_stop_twice_is_harmless(tray):
 def test_hotkey_from_other_thread_toggles_recording(tray):
     import threading
     # keyboard fires hotkeys on its own thread
-    threading.Thread(target=lambda: tray.signals.hotkey.emit("mic")).start()
+    threading.Thread(target=lambda: tray.signals.hotkey.emit("toggle")).start()
     assert wait_for(lambda: tray.recorder is not None and tray.recorder.is_alive())
     time.sleep(0.2)
-    threading.Thread(target=lambda: tray.signals.hotkey.emit("mic")).start()
+    threading.Thread(target=lambda: tray.signals.hotkey.emit("toggle")).start()
     assert wait_for(lambda: tray.recorder is None)
 
 
 def test_hotkey_field_captures_alt_shift_letter(tray):
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
-    edit = tray.settings_window.hk_mic
+    edit = tray.settings_window.hk_record
     tray.settings_window.show()
     edit.setFocus()
     QTest.keyClick(edit, Qt.Key.Key_R, Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier)
