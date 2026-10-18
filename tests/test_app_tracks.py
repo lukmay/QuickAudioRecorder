@@ -6,10 +6,10 @@ import types
 
 import numpy as np
 import soundfile as sf
-
-import audio_recorder
 from conftest import FakeDevice, dominant_freq
 from test_tracks import THREE_TRACKS, record_tracks
+
+import audio_recorder
 
 
 class FakeSender:
@@ -106,6 +106,25 @@ def test_an_application_track_keeps_its_own_file(tmp_path, monkeypatch):
     assert os.path.basename(app_file).endswith("_application.wav")
     data, sr = sf.read(app_file)
     assert abs(dominant_freq(data, sr) - 1000) < 10
+
+
+def test_application_capture_keeps_the_selected_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+    selected = []
+
+    class SelectedAppRecorder(StubAppRecorder):
+        def __init__(self, pid, filepath, name=None):
+            selected.append(pid)
+            super().__init__(pid, filepath, name)
+
+    import process_utils
+    monkeypatch.setattr(process_utils, "get_root_pid", lambda pid: 1)
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", SelectedAppRecorder)
+    path, error = record_tracks(tmp_path, [
+        {"kind": "application", "target_pid": 4242, "target_name": "Player"},
+    ], output_format="wav")
+    assert path and not error
+    assert selected == [4242]
 
 
 def test_a_failing_application_track_is_reported_not_fatal(tmp_path, monkeypatch):

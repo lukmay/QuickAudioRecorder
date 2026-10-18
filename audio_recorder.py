@@ -1,14 +1,15 @@
-import soundcard as sc
-import soundfile as sf
 import contextlib
+import os
 import queue
-import types
+import tempfile
 import threading
 import time
-import os
+import types
+
 import lameenc
 import numpy as np
-import tempfile
+import soundcard as sc
+import soundfile as sf
 
 # Track kinds and output modes for the track list.
 TRACK_KIND_INPUT = "input"
@@ -332,14 +333,14 @@ class AudioRecorder(threading.Thread):
         self.tracks = normalize_tracks(tracks if tracks is not None
                                        else tracks_from_mode(mic_id, source_mode))
         self.output_mode = normalize_output_mode(output_mode)
-        
+
         self.recording = False
         self.stop_event = threading.Event()
         self.error_message = None
         self.final_filepath = None
         self.final_filepaths = []
         self.track_labels = []
-        
+
         # Temp files
         self.temp_files = []
         self.recorders = []
@@ -399,7 +400,7 @@ class AudioRecorder(threading.Thread):
         self.recorders = []
         self.track_labels = []
         self.final_filepaths = []
-        
+
         try:
             # 1. Setup Recorders - one per configured track. Labels get a
             # number when a kind repeats, so two tracks never share a filename.
@@ -417,6 +418,8 @@ class AudioRecorder(threading.Thread):
                 temp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
                 self.temp_files.append(temp_path)
                 if track["kind"] == TRACK_KIND_APP:
+                    # proc-tap includes descendants of the selected process.
+                    # Walking to an OS/launcher ancestor captures unrelated apps.
                     self.recorders.append(ProcTapRecorder(
                         track.get("target_pid"), temp_path,
                         name=track.get("target_name") or None))
@@ -443,7 +446,7 @@ class AudioRecorder(threading.Thread):
             # 2. Start Recording
             for r in self.recorders:
                 r.start()
-            
+
             # 3. Wait for the stop signal. A recorder only ends on its own when
             # its device is lost, then stop and save what was captured so far.
             while not self.stop_event.wait(0.5):
@@ -486,15 +489,17 @@ class AudioRecorder(threading.Thread):
                 if self.output_mode == "separate_files" and len(sources) > 1:
                     # Keep one file per track, all at the shared mix rate so
                     # they describe the same span and can be re-mixed later.
-                    mix_rate = self._plan_mix(sources)[0]
+                    mix_rate, _, mix_length, ratios = self._plan_mix(sources)
                     self.final_filepaths = []
-                    for source, label in zip(sources, labels):
+                    for source, label, ratio in zip(sources, labels, ratios):
                         path = os.path.join(
                             self.output_folder,
                             f"Recording_{timestamp}_{label}.{self.output_format}")
-                        self._write_output([source], path, samplerate=mix_rate)
+                        self._write_output([source], path, samplerate=mix_rate,
+                                           mix_plan=(mix_rate, source.channels, mix_length, [ratio]))
                         self.final_filepaths.append(path)
-                    self.final_filepath = self.final_filepaths
+                        # Keep earlier outputs visible if a later encoder fails.
+                        self.final_filepath = list(self.final_filepaths)
                 else:
                     path = os.path.join(
                         self.output_folder,
@@ -521,7 +526,7 @@ class AudioRecorder(threading.Thread):
                     try:
                         os.remove(t)
                     except: pass
-                
+
             if self.callback:
                 self.callback(self.final_filepath, self.error_message)
 
@@ -573,8 +578,8 @@ class AudioRecorder(threading.Thread):
             data = np.concatenate((data, np.zeros((count - len(data), data.shape[1]), dtype='float32')))
         return data
 
-    def _mixed_blocks(self, sources, gains=None, block=65536, samplerate=None):
-        samplerate, channels, length, ratios = self._plan_mix(sources, samplerate)
+    def _mixed_blocks(self, sources, gains=None, block=65536, samplerate=None, mix_plan=None):
+        samplerate, channels, length, ratios = mix_plan or self._plan_mix(sources, samplerate)
         gains = gains or [1.0] * len(sources)
         for start in range(0, length, block):
             count = min(block, length - start)
@@ -584,8 +589,8 @@ class AudioRecorder(threading.Thread):
                 mixed += g * self._read_block(s, start, count, ratio)
             yield np.clip(mixed, -1.0, 1.0)
 
-    def _write_output(self, sources, path, samplerate=None):
-        samplerate, channels, length, _ = self._plan_mix(sources, samplerate)
+    def _write_output(self, sources, path, samplerate=None, mix_plan=None):
+        samplerate, channels, length, _ = mix_plan or self._plan_mix(sources, samplerate)
         per_source = self.normalize and len(sources) > 1
 
         # progress over all passes: per-source peaks, mix peak, final write.
@@ -616,10 +621,10 @@ class AudioRecorder(threading.Thread):
                 peak = max((np.abs(tick(b)).max() for b in s.blocks(65536, dtype='float32')), default=0)
                 source_gains.append(1.0 / peak if peak > 0 else 1.0)
 
-        blocks = lambda: self._mixed_blocks(sources, source_gains, samplerate=samplerate)
+        blocks = lambda: self._mixed_blocks(sources, source_gains, samplerate=samplerate, mix_plan=mix_plan)
         if self.mono and channels > 1:
             channels = 1
-            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains, samplerate=samplerate))
+            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains, samplerate=samplerate, mix_plan=mix_plan))
 
         gain = 1.0
         if self.normalize:
@@ -640,8 +645,11 @@ class AudioRecorder(threading.Thread):
                     f_mp3.write(encoder.encode(pcm.tobytes()))
                 f_mp3.write(encoder.flush())
         else:
-            # WAV or FLAC, soundfile picks the container from the extension
-            with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels) as f_out:
+            # The temporary output path may not have the final extension.
+            output_format = "FLAC" if self.output_format == "flac" else "WAV"
+            subtype = "PCM_16" if self.output_format == "wav" else None
+            with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels,
+                              format=output_format, subtype=subtype) as f_out:
                 for b in blocks():
                     f_out.write(tick(b, write_cost) * gain)
 

@@ -34,7 +34,7 @@ jobs:
           architecture: ${{ matrix.arch }}
 
       - name: Install dependencies
-        run: pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard pyinstaller pytest
+        run: pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard psutil pywin32 pyinstaller pytest
 
       - name: Test
         run: python -m pytest

@@ -1,25 +1,58 @@
 import ctypes
-import sys
-import os
 import json
+import os
 import shutil
+import sys
 import tempfile
 import time
-from ctypes import wintypes
 
-import psutil
-from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow, 
-                             QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
-                             QPushButton, QFileDialog, QMessageBox, QGroupBox, 
-                             QLineEdit, QFormLayout, QCheckBox, QSpinBox, QScrollArea,
-                             QDialog, QListWidget, QListWidgetItem)
-from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence, QImage
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent, QTimer, QPoint, QSize
-import soundcard as sc
 import keyboard
+import soundcard as sc
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
 from audio_recorder import AudioRecorder, get_devices, get_speakers
-from process_utils import get_active_applications, get_foreground_window_info
 from clipboard_utils import copy_file_to_clipboard
+from process_utils import get_active_applications, get_foreground_window_info
 
 CONFIG_FILE = "settings.json"
 
@@ -45,7 +78,7 @@ class HotkeyEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setPlaceholderText("Click to set hotkey...")
-        self.setReadOnly(True) 
+        self.setReadOnly(True)
         self.current_sequence = None
 
     def mousePressEvent(self, event):
@@ -63,12 +96,12 @@ class HotkeyEdit(QLineEdit):
     def keyPressEvent(self, event):
         key = event.key()
         modifiers = event.modifiers()
-        
+
         if key == Qt.Key.Key_Backspace or key == Qt.Key.Key_Delete:
             self.clear()
             self.current_sequence = None
             return
-            
+
         if key == Qt.Key.Key_Escape:
             self.clearFocus()
             return
@@ -104,7 +137,7 @@ class HotkeyEdit(QLineEdit):
 
         if key_text:
             parts.append(key_text)
-            
+
         final_hotkey = "+".join(parts)
         self.setText(final_hotkey)
         self.current_sequence = final_hotkey
@@ -389,7 +422,12 @@ def _bitblt_desktop_rect(hwnd, width, height):
 
 
 
-# source window straight onto our dialog. That removes the per-second
+_DWM_TNP_RECTDESTINATION = 0x00000001
+_DWM_TNP_OPACITY = 0x00000004
+_DWM_TNP_VISIBLE = 0x00000008
+_DWM_TNP_SOURCECLIENTAREAONLY = 0x00000010
+
+# DWM draws the source window straight onto our dialog. That removes the per-second
 # PrintWindow/BitBlt capture that made the picker laggy. The struct layout
 # below mirrors the native DWM_THUMBNAIL_PROPERTIES (DWORD, RECT, RECT, BYTE,
 # BOOL, BOOL) so ctypes packs it correctly.
@@ -416,8 +454,8 @@ class _DwmThumbnailProps(ctypes.Structure):
         ("rcDestination", _DwmRect),
         ("rcSource", _DwmRect),
         ("opacity", ctypes.c_byte),
-        ("fVisible", ctypes.c_bool),
-        ("fSourceClientAreaOnly", ctypes.c_bool),
+        ("fVisible", ctypes.c_int32),
+        ("fSourceClientAreaOnly", ctypes.c_int32),
     ]
 
 
@@ -489,7 +527,8 @@ class AppPickerDialog(QDialog):
         apps = self._sort_apps(apps)
 
         current = self.list.currentItem()
-        selected_key = current.data(Qt.ItemDataRole.UserRole) if current else None
+        selected_key = (current.data(Qt.ItemDataRole.UserRole),
+                        current.data(Qt.ItemDataRole.UserRole + 1)) if current else None
 
         seen = set()
         for app in apps:
@@ -500,7 +539,7 @@ class AppPickerDialog(QDialog):
             text = f"{title}\n{name}" if title else name
             item = self._item_map.get(key)
             if item is None:
-                item = QListWidgetItem()
+                item = QListWidgetItem(text)
                 item.setSizeHint(
                     QSize(self.THUMBNAIL_SIZE[0] + 16, self.THUMBNAIL_SIZE[1] + 44)
                 )
@@ -745,17 +784,27 @@ class TrackEditor(QWidget):
         self.kind_combo = QComboBox()
         self.kind_combo.addItems([self.KIND_INPUT, self.KIND_OUTPUT, self.KIND_APP])
         self.kind_combo.currentIndexChanged.connect(self.on_kind_changed)
-        layout.addWidget(self.kind_combo, 2)
+        self.kind_combo.setFixedWidth(self.kind_combo.sizeHint().width())
+        layout.addWidget(self.kind_combo)
 
+        self.source_widget = QWidget()
+        source_layout = QHBoxLayout(self.source_widget)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(layout.spacing())
         self.device_combo = QComboBox()
-        layout.addWidget(self.device_combo, 3)
+        self.device_combo.setMinimumWidth(0)
+        self.device_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        source_layout.addWidget(self.device_combo, 1)
+        layout.addWidget(self.source_widget, 1)
 
         self.app_btn = QPushButton("Choose App...")
         self.app_btn.setToolTip("Capture one application's audio")
         self.app_btn.clicked.connect(self.open_app_picker)
-        layout.addWidget(self.app_btn)
+        source_layout.addWidget(self.app_btn)
+        self.app_btn.hide()
 
         btn_remove = QPushButton("Remove")
+        self.remove_btn = btn_remove
         btn_remove.clicked.connect(lambda: self.removed.emit(self))
         layout.addWidget(btn_remove)
 
@@ -769,11 +818,15 @@ class TrackEditor(QWidget):
 
     def on_kind_changed(self, _index=None):
         if not self._loading:
-            self.refresh_devices()
+            self.refresh_devices(preserve_selection=False)
 
-    def refresh_devices(self):
-        """Fills the device list for the selected kind."""
-        self.app_btn.setEnabled(self.current_kind() == "application")
+    def refresh_devices(self, _checked=False, *, preserve_selection=True):
+        """Refresh choices without silently changing a configured source."""
+        selected = self.device_combo.currentData() if preserve_selection else None
+        selected_text = self.device_combo.currentText()
+        is_application = self.current_kind() == "application"
+        self.app_btn.setVisible(is_application)
+        self.app_btn.setEnabled(is_application)
         self._loading = True
         try:
             self.device_combo.clear()
@@ -797,6 +850,12 @@ class TrackEditor(QWidget):
         except Exception as e:
             print(f"Error refreshing devices: {e}")
         finally:
+            if selected is not None:
+                index = self.device_combo.findData(selected)
+                if index < 0:
+                    self.device_combo.addItem(selected_text, selected)
+                    index = self.device_combo.count() - 1
+                self.device_combo.setCurrentIndex(index)
             self._loading = False
 
     @staticmethod
@@ -820,7 +879,7 @@ class TrackEditor(QWidget):
             self._loading = True
             self.kind_combo.setCurrentText(self.KIND_APP)
             self._loading = False
-            self.refresh_devices()
+            self.refresh_devices(preserve_selection=False)
         label = self.app_text(title, name)
         index = self.device_combo.findData(pid)
         if index < 0:
@@ -846,7 +905,7 @@ class TrackEditor(QWidget):
         self._loading = True
         self.kind_combo.setCurrentText(label)
         self._loading = False
-        self.refresh_devices()
+        self.refresh_devices(preserve_selection=False)
         if kind == "output":
             wanted = track.get("speaker_id")
         elif kind == "application":
@@ -855,8 +914,11 @@ class TrackEditor(QWidget):
             wanted = track.get("input_id")
         if wanted is not None:
             index = self.device_combo.findData(wanted)
-            if index >= 0:
-                self.device_combo.setCurrentIndex(index)
+            if index < 0:
+                # Keep an unavailable source instead of silently recording another.
+                self.device_combo.addItem(f"Unavailable — select a device ({wanted})", wanted)
+                index = self.device_combo.count() - 1
+            self.device_combo.setCurrentIndex(index)
 
 
 class SettingsWindow(QMainWindow):
@@ -866,7 +928,7 @@ class SettingsWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("Settings - Simple Audio Recorder")
         self.setGeometry(100, 100, 500, 600)
-        
+
         self.init_ui()
         self.load_settings()
         if not self.track_editors():
@@ -901,21 +963,21 @@ class SettingsWindow(QMainWindow):
         # Output
         group_out = QGroupBox("Output Configuration")
         layout_out = QFormLayout()
-        
+
         layout_folder_inner = QHBoxLayout()
         self.lbl_folder = QLabel(os.getcwd())
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self.browse_folder)
         layout_folder_inner.addWidget(self.lbl_folder)
         layout_folder_inner.addWidget(btn_browse)
-        
+
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems(["MP3", "WAV", "FLAC"])
         self.chk_mono = QCheckBox("Save as mono (half the size, good for voice)")
         self.combo_output_mode = QComboBox()
         self.combo_output_mode.addItem("Mixed (one file)", "mixed")
         self.combo_output_mode.addItem("Separate files", "separate_files")
-        
+
         layout_out.addRow("Folder:", layout_folder_inner)
         layout_out.addRow("Format:", self.combo_fmt)
         layout_out.addRow("Output mode:", self.combo_output_mode)
@@ -946,7 +1008,7 @@ class SettingsWindow(QMainWindow):
         self.chk_delete.setToolTip("Moves the file to the system temp folder before copying, keeping your output folder clean.")
         self.chk_delete.setEnabled(False)
         self.chk_clipboard.toggled.connect(lambda c: self.chk_delete.setEnabled(c))
-        
+
         layout_post.addWidget(self.chk_normalize)
         layout_post.addWidget(self.chk_clipboard)
         layout_post.addWidget(self.chk_delete)
@@ -1019,13 +1081,13 @@ class SettingsWindow(QMainWindow):
     def load_settings(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(CONFIG_FILE) as f:
                     data = json.load(f)
-                    
+
                 self.lbl_folder.setText(data.get("output_folder", os.getcwd()))
                 fmt_idx = self.combo_fmt.findText(data.get("format", "MP3"))
                 if fmt_idx >= 0: self.combo_fmt.setCurrentIndex(fmt_idx)
-                
+
                 self.clear_tracks()
                 for track in data.get("tracks") or []:
                     self.add_track(track)
@@ -1087,7 +1149,7 @@ class TrayApplication(QObject):
         super().__init__()
         self.app = app
         self.recorder = None
-        
+
         self.signals = SignalManager()
         self.signals.recording_finished.connect(self.on_recording_finished)
         self.signals.saving.connect(self.on_saving)
@@ -1105,17 +1167,17 @@ class TrayApplication(QObject):
         self.icon_idle_path = resource_path("icon_idle.png")
         self.icon_rec_path = resource_path("icon_rec.png")
         self.generate_icons()
-            
+
         self.tray_icon = QSystemTrayIcon(QIcon(self.icon_idle_path), self.app)
         self.tray_icon.setToolTip("Simple Audio Recorder (Idle)")
         self.tray_icon.activated.connect(self.on_tray_activated)
-        
+
         self.build_menu()
         self.tray_icon.show()
-        
+
         self.settings_window = SettingsWindow()
         self.settings_window.settings_saved.connect(self.register_hotkeys)
-        
+
         self.notify("Ready", "Left-click to toggle recording.", QSystemTrayIcon.MessageIcon.Information, 2000)
         self.register_hotkeys()
 
@@ -1156,7 +1218,7 @@ class TrayApplication(QObject):
         self.action_settings.triggered.connect(self.open_settings)
         self.action_exit = QAction("Exit", self)
         self.action_exit.triggered.connect(self.exit_app)
-        
+
         self.menu.addAction(self.action_record)
         self.menu.addAction(self.action_stop)
         self.menu.addSeparator()
@@ -1208,7 +1270,7 @@ class TrayApplication(QObject):
         settings = self.settings_window.get_settings()
         target_id = settings['device_id']
         use_tracks = mode == "tracks"
-        
+
         def finish_callback(path, error):
             self.signals.recording_finished.emit(path if path else "", error if error else "")
 
@@ -1230,7 +1292,7 @@ class TrayApplication(QObject):
         self.recorder.start()
         self.action_record.setEnabled(False)
         self.action_stop.setEnabled(True)
-        self.tray_icon.setIcon(QIcon(self.icon_rec_path)) 
+        self.tray_icon.setIcon(QIcon(self.icon_rec_path))
         self.tray_icon.setToolTip(f"Recording ({mode}) 00:00")
         self.rec_started = time.monotonic()
         self.rec_timer.start()
@@ -1331,10 +1393,9 @@ class TrayApplication(QObject):
                     keepers = moved
                     msg = "Moved to Temp & Copied to Clipboard."
 
-                for p in keepers:
-                    success, status = copy_file_to_clipboard(p)
-                    if not success:
-                        msg += f"\nClipboard Error: {status}"
+                success, status = copy_file_to_clipboard(keepers)
+                if not success:
+                    msg += f"\nClipboard Error: {status}"
                 if not settings['delete_after']:
                     msg += "\nCopied to clipboard."
             except Exception as e:

@@ -62,6 +62,108 @@ def test_a_track_picks_its_own_source(window):
     assert editor.get_track() == {"kind": "input", "input_id": "Fake Mic"}
 
 
+def test_unavailable_endpoint_id_survives_settings_round_trip(window, tmp_path):
+    endpoint_id = "{0.0.1.00000000}.{missing-endpoint}"
+    with open(tmp_path / gui.CONFIG_FILE, "w") as f:
+        json.dump({"device_id": endpoint_id}, f)
+    window.load_settings()
+    assert window.get_tracks()[0]["input_id"] == endpoint_id
+    assert "Unavailable" in window.track_editors()[0].device_combo.currentText()
+    with open(tmp_path / gui.CONFIG_FILE, "w") as f:
+        json.dump(window.get_settings(), f)
+    window.load_settings()
+    assert window.get_tracks()[0]["input_id"] == endpoint_id
+    editor = window.track_editors()[0]
+    editor.device_combo.setCurrentIndex(editor.device_combo.findData("Fake Mic"))
+    assert window.get_tracks()[0]["input_id"] == "Fake Mic"
+
+
+def test_default_device_does_not_have_to_be_first(window, monkeypatch):
+    monkeypatch.setattr(gui, "get_devices", lambda **kwargs: [
+        {"id": "other", "name": "Other"},
+        {"id": "Fake Mic", "name": "Default"},
+    ])
+    editor = window.track_editors()[0]
+    editor.refresh_devices()
+    assert editor.get_track()["input_id"] == "Fake Mic"
+
+
+@pytest.mark.parametrize("kind,key,value", [
+    ("input", "input_id", "missing-mic"),
+    ("output", "speaker_id", "missing-speaker"),
+    ("application", "target_pid", 987654),
+])
+def test_refresh_preserves_selected_source(window, monkeypatch, kind, key, value):
+    monkeypatch.setattr(gui, "get_active_applications", list)
+    editor = window.track_editors()[0]
+    editor.set_track({"kind": kind, key: value})
+    editor.refresh_devices()
+    assert editor.get_track()[key] == value
+
+
+def test_refresh_preserves_nondefault_available_source(window, monkeypatch):
+    monkeypatch.setattr(gui, "get_devices", lambda **kwargs: [
+        {"id": "other", "name": "Other"},
+        {"id": "Fake Mic", "name": "Default"},
+    ])
+    editor = window.track_editors()[0]
+    editor.set_track({"kind": "input", "input_id": "other"})
+    editor.refresh_devices()
+    assert editor.get_track()["input_id"] == "other"
+
+
+def test_refresh_preserves_application_source(window, monkeypatch):
+    app = {"pid": 987654, "name": "player.exe", "title": "Player"}
+    monkeypatch.setattr(gui, "get_active_applications", lambda: [app])
+    editor = window.track_editors()[0]
+    editor.set_track({"kind": "application", "target_pid": app["pid"],
+                      "target_name": app["title"]})
+    editor.refresh_devices()
+    assert editor.get_track()["target_pid"] == app["pid"]
+
+
+def test_track_columns_align_and_only_apps_show_picker(window, monkeypatch):
+    monkeypatch.setattr(gui, "get_active_applications", list)
+    editors = [window.track_editors()[0], window.add_track(), window.add_track()]
+    for editor, kind in zip(editors, ["input", "output", "application"], strict=True):
+        editor.set_track({"kind": kind})
+    window.resize(850, 650)
+    window.show()
+    window._test_app.processEvents()
+    try:
+        assert [not row.app_btn.isHidden() for row in editors] == [False, False, True]
+        for attribute in ["kind_combo", "source_widget", "remove_btn"]:
+            rects = [getattr(row, attribute).geometry() for row in editors]
+            assert len({(rect.x(), rect.width(), rect.height()) for rect in rects}) == 1
+        app = editors[-1]
+        assert app.device_combo.geometry().right() < app.app_btn.geometry().left()
+    finally:
+        window.hide()
+
+
+def test_picker_initial_items_keep_titles_and_handles(window, monkeypatch):
+    monkeypatch.setattr(gui, "get_active_applications", lambda: [
+        {"pid": 42, "hwnd": 101, "title": "Player", "name": "player.exe"},
+    ])
+    monkeypatch.setattr(gui, "_DWM_AVAILABLE", False)
+    dialog = gui.AppPickerDialog(window)
+    try:
+        item = dialog._item_map[(42, 101)]
+        assert item.text() == "Player\nplayer.exe"
+        dialog._select((42, 101))
+        assert dialog.selected_title == "Player"
+        assert dialog.selected_hwnd == 101
+    finally:
+        dialog.close()
+
+
+def test_dwm_properties_use_windows_bool_layout():
+    import ctypes
+    assert ctypes.sizeof(gui._DwmThumbnailProps) == 48
+    assert gui._DwmThumbnailProps.fVisible.offset == 40
+    assert gui._DwmThumbnailProps.fSourceClientAreaOnly.offset == 44
+
+
 def test_both_output_modes_are_offered(window):
     modes = [window.combo_output_mode.itemData(i)
              for i in range(window.combo_output_mode.count())]

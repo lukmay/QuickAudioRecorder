@@ -7,9 +7,9 @@ import types
 import numpy as np
 import pytest
 import soundfile as sf
+from conftest import FakeDevice, dominant_freq
 
 import audio_recorder
-from conftest import FakeDevice, dominant_freq
 
 
 def multi_device_fake():
@@ -86,7 +86,9 @@ def test_three_tracks_are_captured_simultaneously(tmp_path, monkeypatch):
     for p in paths:
         data, sr = sf.read(p)
         found.append(round(dominant_freq(data, sr)))
-    assert sorted(found) == [440, 1000, 1500]
+    assert found[0] == pytest.approx(440, abs=2)
+    assert found[1] == pytest.approx(1000, abs=5)
+    assert found[2] == pytest.approx(1500, abs=10)
 
 
 def test_separate_mode_names_each_track(tmp_path, monkeypatch):
@@ -127,6 +129,47 @@ def test_mixed_mode_writes_one_file_containing_every_track(tmp_path, monkeypatch
     freqs = np.fft.rfftfreq(len(data), 1 / sr)
     for wanted in (440, 1000, 1500):
         assert spectrum[np.abs(freqs - wanted) < 3].max() > 0
+
+
+def test_separate_render_uses_shared_length_and_drift_ratio(tmp_path):
+    paths = [tmp_path / "short.wav", tmp_path / "long.wav"]
+    for path, frames in zip(paths, [47900, 48000]):
+        sf.write(path, np.full((frames, 1), 0.2), 48000)
+    rec = audio_recorder.AudioRecorder(output_format="wav")
+    sources = [sf.SoundFile(path) for path in paths]
+    try:
+        rate, _, length, ratios = rec._plan_mix(sources)
+        for index, (source, ratio) in enumerate(zip(sources, ratios)):
+            output = tmp_path / f"out{index}.wav"
+            rec._write_output([source], str(output),
+                              mix_plan=(rate, source.channels, length, [ratio]))
+            assert sf.info(output).frames == 48000
+            data, _ = sf.read(output)
+            # Interpolation can pad the final fractional sample, not the
+            # 100-frame tail that an uncorrected short source would leave.
+            assert np.min(data[-90:-2]) > 0.19
+    finally:
+        for source in sources:
+            source.close()
+
+
+def test_separate_encoding_failure_keeps_completed_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", multi_device_fake())
+    original = audio_recorder.AudioRecorder._write_output
+    calls = []
+
+    def write(self, sources, path, **kwargs):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("disk full")
+        return original(self, sources, path, **kwargs)
+
+    monkeypatch.setattr(audio_recorder.AudioRecorder, "_write_output", write)
+    paths, error = record_tracks(tmp_path, THREE_TRACKS, output_format="wav",
+                                 output_mode="separate_files")
+    assert "disk full" in error
+    assert paths == [calls[0]]
+    assert sf.info(paths[0]).frames > 0
 
 
 def test_separate_mode_with_a_single_track_writes_one_file(tmp_path, monkeypatch):

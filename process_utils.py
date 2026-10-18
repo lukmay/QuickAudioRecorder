@@ -6,6 +6,8 @@ the module still imports and simply reports that no applications are
 available, rather than taking the recorder down with it.
 """
 
+import os
+
 try:
     import psutil
 except ImportError:  # pragma: no cover - depends on the local install
@@ -55,32 +57,40 @@ def get_foreground_pid():
 
 
 def get_active_applications():
-    """Return visible, titled windows as app choices for the settings dialog.
-
-    Windows with no title (tool windows, the shell's own chrome) are skipped,
-    and so are the shell host processes that only ever appear as containers
-    for real apps. Results are de-duplicated per process and sorted by title.
-    """
+    """Return window-level choices, including handles needed for previews."""
     if not _available():
         return []
 
-    skip = {"explorer.exe", "applicationframehost.exe"}
     windows = {}
 
     def visit(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return True
-        title = win32gui.GetWindowText(hwnd).strip()
-        if not title:
-            return True
         try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            left, top, _, _ = win32gui.GetWindowRect(hwnd)
+            if left <= -32000 or top <= -32000:
+                return True
+            title = win32gui.GetWindowText(hwnd).strip()
+            if not title:
+                child = win32gui.GetWindow(hwnd, 5)  # GW_CHILD
+                while child:
+                    title = win32gui.GetWindowText(child).strip()
+                    if title:
+                        break
+                    child = win32gui.GetWindow(child, 2)  # GW_HWNDNEXT
             pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-            name = psutil.Process(pid).name()
+            if pid == os.getpid():
+                return True
+            process = psutil.Process(pid)
+            name = process.name()
+            try:
+                created = process.create_time()
+            except Exception:
+                created = 0.0
+            windows[hwnd] = {"pid": pid, "name": name, "title": title or name,
+                             "hwnd": hwnd, "create_time": created}
         except Exception:
             return True
-        if name.lower() in skip:
-            return True
-        windows.setdefault(pid, {"pid": pid, "name": name, "title": title})
         return True
 
     win32gui.EnumWindows(visit, None)

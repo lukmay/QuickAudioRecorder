@@ -35,9 +35,12 @@ AI-generated PRs are not rejected on principle, but they tend to over-engineer a
 ## Development setup
 
 ```bash
-pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard
+pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard psutil pywin32
 python main.py
 ```
+
+For application-audio tracks, also install `proc-tap` (`pip install proc-tap`).
+Install it before freezing if application capture should be included in the executable.
 
 Run the tests before sending a PR:
 
