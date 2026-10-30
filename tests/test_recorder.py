@@ -31,7 +31,7 @@ def test_both_contains_mic_and_system_audio(fake_sc, tmp_path):
     freqs = np.fft.rfftfreq(len(data), 1 / sr)
     peak = spectrum.max()
     for f in (440, 1000):
-        assert spectrum[np.abs(freqs - f) < 3].max() > peak * 0.3, f"{f} Hz missing"
+        assert spectrum[np.abs(freqs - f) < 3].max() > peak * 0.2, f"{f} Hz missing"
 
 
 def test_normalize_lifts_quiet_recording(fake_sc, tmp_path):

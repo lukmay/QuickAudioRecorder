@@ -34,14 +34,28 @@ jobs:
           architecture: ${{ matrix.arch }}
 
       - name: Install dependencies
-        run: pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard pyinstaller pytest
+        run: |
+          python -m pip install --only-binary=:all: -r requirements-build.txt
+
+      - name: Build native application-capture dependency
+        shell: pwsh
+        run: ./scripts/build_proctap.ps1 -Architecture ${{ matrix.arch }}
 
       - name: Test
         run: python -m pytest
 
       - name: Build
         # UPX-packed exes get flagged by antivirus scanners far more often (#10)
-        run: pyinstaller --noconsole --onefile --noupx --name ${{ matrix.exe }} main.py
+        run: python -m PyInstaller --noconsole --onefile --noupx --additional-hooks-dir packaging/hooks --name ${{ matrix.exe }} main.py
+
+      - name: Verify executable architecture
+        run: python scripts/check_pe_arch.py ${{ matrix.arch }} dist/${{ matrix.exe }}.exe
+
+      - name: Retain build artifacts for manual validation
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.exe }}
+          path: dist/${{ matrix.exe }}.exe
 
       - name: Checksum
         shell: pwsh

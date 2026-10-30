@@ -89,30 +89,33 @@ The exe is built by [GitHub Actions](.github/workflows/release.yml) straight fro
 ## Usage
 
 1.  **Right-click** the tray icon to open **Settings**.
-2.  Select your **Microphone** and **Output Folder**.
-3.  Set your **Hotkeys** (optional).
-4.  **Left-click** the tray icon or use a hotkey to start recording.
-5.  Click again to stop. The file is saved and ready to use!
+2.  Add one or more tracks, choosing a microphone, WASAPI system-audio loopback, or a specific application for each track.
+3.  Choose mixed output or separate files, then select an **Output Folder**.
+4.  Set your **Hotkeys** (optional).
+5.  **Left-click** the tray icon or use a hotkey to start recording.
+6.  Click again to stop. The file(s) are saved and ready to use!
+
+Hardware capture uses SoundCard's Windows input and loopback endpoints, with sounddevice as a fallback for microphones that SoundCard cannot open. Capture is streamed to temporary WAV files before output encoding.
+
+The application-source track uses the `proc-tap` distribution (`proctap` import). The release workflow builds its native extension from verified source on both x64 and ARM64; see [native build instructions and verification status](BUILDING.md). Source-only hardware recording does not require it. If application capture is unavailable or falls back to system-wide audio, the recording reports an explicit error and preserves usable hardware tracks. Native ARM64 runtime verification is still outstanding; build configuration alone does not establish runtime support.
 
 ## Development
 
 ### Requirements
 -   Python 3.12+
--   `pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard`
+-   `pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard psutil pywin32`
 
 ### Tests
 ```bash
 pip install pytest
 python -m pytest
 ```
-The tests use fake audio devices, so they run anywhere. If [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) is installed, `tests/test_cable.py` also records a real tone through the cable without touching your default speakers or microphone.
+Most tests use fake audio devices, so they do not access hardware. The optional `tests/test_cable.py` test records a real tone through [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) without touching your default speakers or microphone.
 
 ### Build from Source
-To create the standalone executable:
-```bash
-pip install pyinstaller
-pyinstaller --noconsole --onefile --noupx --name QuickAudioRecorder main.py
-```
+Follow [BUILDING.md](BUILDING.md) for pinned dependencies, the native proc-tap build,
+PyInstaller hooks, architecture checks and required hardware validation on each
+architecture. Use a native build environment matching the intended executable.
 
 ## License
 

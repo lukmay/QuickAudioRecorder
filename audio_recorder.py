@@ -1,14 +1,70 @@
-import soundcard as sc
-import soundfile as sf
 import contextlib
+import os
 import queue
-import types
+import tempfile
 import threading
 import time
-import os
+import types
+
 import lameenc
 import numpy as np
-import tempfile
+import soundcard as sc
+import soundfile as sf
+
+from soundcard_compat import apply_soundcard_compat
+
+apply_soundcard_compat()
+
+# Track kinds and output modes for the track list.
+TRACK_KIND_INPUT = "input"
+TRACK_KIND_OUTPUT = "output"
+TRACK_KIND_APP = "application"
+TRACK_KINDS = (TRACK_KIND_INPUT, TRACK_KIND_OUTPUT, TRACK_KIND_APP)
+TRACK_LABELS = {TRACK_KIND_INPUT: "input", TRACK_KIND_OUTPUT: "output",
+                TRACK_KIND_APP: "application"}
+VALID_OUTPUT_MODES = ("mixed", "separate_files")
+
+
+def normalize_output_mode(output_mode):
+    mode = str(output_mode or "mixed").strip().lower()
+    if mode not in VALID_OUTPUT_MODES:
+        raise ValueError(f"Unsupported output mode: {output_mode}")
+    return mode
+
+
+def normalize_tracks(tracks):
+    """Validates a track list and fills in defaults. Returns a new list."""
+    if not tracks:
+        raise ValueError("At least one track is required")
+    cleaned = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            raise ValueError(f"Unsupported track: {track!r}")
+        kind = str(track.get("kind") or TRACK_KIND_INPUT).strip().lower()
+        if kind not in TRACK_KINDS:
+            raise ValueError(f"Unsupported track kind: {track.get('kind')}")
+        entry = {"kind": kind}
+        if kind == TRACK_KIND_INPUT:
+            entry["input_id"] = track.get("input_id")
+        elif kind == TRACK_KIND_OUTPUT:
+            entry["speaker_id"] = track.get("speaker_id")
+        else:
+            entry["target_pid"] = track.get("target_pid")
+            entry["target_name"] = track.get("target_name")
+        cleaned.append(entry)
+    return cleaned
+
+
+def tracks_from_mode(mic_id, source_mode):
+    """Maps the older single-source interface onto a track list."""
+    mode = str(source_mode or "mic").strip().lower()
+    if mode == "loopback":
+        return [{"kind": TRACK_KIND_OUTPUT, "speaker_id": None}]
+    if mode == "both":
+        return [{"kind": TRACK_KIND_INPUT, "input_id": mic_id},
+                {"kind": TRACK_KIND_OUTPUT, "speaker_id": None}]
+    return [{"kind": TRACK_KIND_INPUT, "input_id": mic_id}]
+
 
 class PortAudioDevice:
     """
@@ -39,7 +95,10 @@ class PortAudioDevice:
         import sounddevice as sd
         # Callback mode: blocking reads of 2048 frames dropped audio over WASAPI
         blocks = queue.Queue()
+        # Give WASAPI's shared-mode rate conversion scheduling headroom.
+        # The short default buffer can lose frames without callback status flags.
         stream = sd.InputStream(device=self.index, samplerate=samplerate, channels=channels,
+                                latency=0.2,
                                 dtype="float32", extra_settings=sd.WasapiSettings(auto_convert=True),
                                 callback=lambda data, frames, t, status: blocks.put(data.copy()))
         pending = np.zeros((0, channels), dtype="float32")
@@ -72,6 +131,13 @@ class RawRecorder(threading.Thread):
         self.error = None
         self.frames = 0  # written so far, kept if the device is lost midway
 
+    def _open_stream(self, samplerate, channels):
+        # SoundCard's default WASAPI buffer can be shorter than one read.
+        # Leave scheduling headroom (VAIO3 drops packets with the default at
+        # 44.1 kHz) while keeping the existing 2048-frame read/stop cadence.
+        options = {} if isinstance(self.device, PortAudioDevice) else {"blocksize": 8192}
+        return self.device.recorder(samplerate=samplerate, channels=channels, **options)
+
     def _probe_params(self):
         """Find working (samplerate, channels) for this device."""
         channels = self.channels
@@ -86,7 +152,7 @@ class RawRecorder(threading.Thread):
         for sr in rates:
             for ch in channel_options:
                 try:
-                    with self.device.recorder(samplerate=sr, channels=ch):
+                    with self._open_stream(samplerate=sr, channels=ch):
                         return sr, ch
                 except Exception as e:
                     # soundcard raises a bare AssertionError for some mics, keep the type visible
@@ -111,7 +177,7 @@ class RawRecorder(threading.Thread):
         try:
             samplerate, channels = self.samplerate, self.channels
             with sf.SoundFile(self.filepath, mode='w', samplerate=samplerate, channels=channels) as f_wav:
-                with self.device.recorder(samplerate=samplerate, channels=channels) as mic:
+                with self._open_stream(samplerate=samplerate, channels=channels) as mic:
                     while not self.stop_event.is_set():
                         data = mic.record(numframes=2048)
                         f_wav.write(data)
@@ -124,13 +190,190 @@ class RawRecorder(threading.Thread):
         self.stop_event.set()
         self.join()
 
+# Application capture runs through proc-tap in a child process. The capture
+# format is fixed, so these double as the recorder's rate and channel count.
+PROC_TAP_SAMPLERATE = 48000
+PROC_TAP_CHANNELS = 2
+
+
+def _pid_alive(pid):
+    """True if the target process is still running."""
+    try:
+        import psutil
+
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return True
+
+
+def _decode_message(message):
+    """Normalize a capture message to ("data", bytes) or ("error", reason, detail)."""
+    if isinstance(message, tuple) and message:
+        if message[0] == "error":
+            return ("error", message[1], message[2])
+        if message[0] == "data":
+            return message
+    return ("data", message)
+
+
+def _process_tap_worker(pid, sender):
+    """Runs native application capture outside the tray process.
+
+    A fault inside the capture library would otherwise take the whole app down
+    with it, so the work happens in a spawned child.
+    """
+    capture = None
+    try:
+        import proctap
+
+        capture = proctap.ProcessAudioCapture(pid)
+        if os.name == "nt":
+            # proc-tap 1.1.1 silently falls back to whole-system loopback.
+            # Fail closed: a selected app must never capture unrelated audio.
+            native = getattr(getattr(capture, "_backend", None), "_native", None)
+            isolated = getattr(native, "is_process_specific", None)
+            if not callable(isolated) or not isolated():
+                raise RuntimeError("Process-specific audio capture is unavailable; "
+                                   "refusing system-wide audio fallback.")
+        capture.start()
+        sender.send(("ready", time.monotonic()))
+        while True:
+            data = capture.read(timeout=0.1)
+            if data:
+                # Timestamp before pipe delivery: a stalled parent must not
+                # turn buffered audio into extra silence in the output.
+                sender.send(("data", data, time.monotonic()))
+    except Exception as e:
+        # Report the real failure. Dying silently would look like the user's
+        # application had simply closed.
+        try:
+            reason = "failed" if _pid_alive(pid) else "closed"
+            sender.send(("error", reason, str(e) or type(e).__name__))
+        except Exception:
+            pass
+    finally:
+        if capture is not None:
+            try:
+                capture.stop()
+                capture.close()
+            except Exception:
+                pass
+
+
+class ProcTapRecorder(threading.Thread):
+    """Records one application's audio to a WAV file.
+
+    The child streams float32 buffers back over a pipe and this thread writes
+    them out, so the mixing stage opens the result like any other track.
+    """
+    samplerate = PROC_TAP_SAMPLERATE
+    channels = PROC_TAP_CHANNELS
+
+    def __init__(self, pid, filepath, name=None):
+        super().__init__()
+        self.pid = pid
+        self.filepath = filepath
+        self.device = types.SimpleNamespace(name=name or f"application {pid}")
+        self.stop_event = threading.Event()
+        self.error = None
+        self.exit_reason = None
+        self.chunks_read = 0
+        self.frames = 0
+        self.ready_event = threading.Event()
+        self.session_started: threading.Event | None = None
+        self.session_epoch: float | None = None
+
+    def probe(self):
+        """Matches RawRecorder's interface; the capture format is fixed."""
+
+    def run(self):
+        import multiprocessing
+
+        process = None
+        receiver = None
+        started_at = time.monotonic()
+        try:
+            receiver, sender = multiprocessing.Pipe(duplex=False)
+            context = multiprocessing.get_context("spawn")
+            process = context.Process(target=_process_tap_worker, args=(self.pid, sender), daemon=True)
+            process.start()
+            sender.close()
+            with sf.SoundFile(self.filepath, mode="w", samplerate=self.samplerate,
+                              channels=self.channels) as f_wav:
+                # Pipe timeouts are not source silence. Leave gaps provisional
+                # until a timestamped packet (or stop) establishes their extent.
+                while not self.stop_event.is_set():
+                    if receiver.poll(0.1):
+                        incoming = receiver.recv()
+                        if isinstance(incoming, tuple) and incoming[0] == "ready":
+                            started_at = incoming[1]
+                            self.ready_event.set()
+                            if self.session_started is not None:
+                                while not self.session_started.wait(0.05):
+                                    if self.stop_event.is_set():
+                                        return
+                                assert self.session_epoch is not None
+                                started_at = self.session_epoch
+                            continue
+                        message = _decode_message(incoming)
+                        if message[0] == "error":
+                            self.exit_reason = message[1]
+                            raise RuntimeError(message[2])
+                        data = np.frombuffer(message[1], dtype=np.float32).reshape(-1, self.channels)
+                        if len(message) > 2:
+                            packet_end = round((message[2] - started_at) * self.samplerate)
+                            packet_start = packet_end - len(data)
+                            if packet_end <= 0:
+                                continue  # Captured during preparation, before the session.
+                            if packet_start < 0:
+                                data = data[-packet_start:]
+                                packet_start = 0
+                            # Worker timestamps approximate native packet time;
+                            # never collapse a short quiet gap into later audio.
+                            self._write_silence_until(f_wav, packet_start)
+                        f_wav.write(data)
+                        self.frames += len(data)
+                        self.chunks_read += 1
+                    elif process is not None and not process.is_alive():
+                        if _pid_alive(self.pid):
+                            self.exit_reason = "failed"
+                            raise RuntimeError("Audio capture stopped unexpectedly.")
+                        self.exit_reason = "closed"
+                        raise RuntimeError("The application stopped or exited.")
+                self._write_silence_until(
+                    f_wav, round((time.monotonic() - started_at) * self.samplerate))
+        except Exception as e:
+            self.error = str(e)
+        finally:
+            if receiver is not None:
+                try:
+                    receiver.close()
+                except Exception:
+                    pass
+            if process is not None:
+                process.terminate()
+                process.join(timeout=1.0)
+
+    def _write_silence_until(self, output, frame):
+        """Fill a known timeline gap with bounded-size blocks."""
+        silence = np.zeros((4800, self.channels), dtype=np.float32)
+        while self.frames < frame:
+            count = min(len(silence), frame - self.frames)
+            output.write(silence[:count])
+            self.frames += count
+
+    def stop(self):
+        self.stop_event.set()
+        self.join()
+
+
 class AudioRecorder(threading.Thread):
     """
     Orchestrates recording from Microphone, Loopback, or Both.
     """
-    def __init__(self, mic_id, source_mode, output_folder, output_format="mp3", 
+    def __init__(self, mic_id=None, source_mode=None, output_folder=None, output_format="mp3",
                  normalize=False, mono=False, on_finish_callback=None, on_progress=None,
-                 on_notice=None):
+                 on_notice=None, tracks=None, output_mode="mixed", on_started=None):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
@@ -141,76 +384,113 @@ class AudioRecorder(threading.Thread):
         self.callback = on_finish_callback
         self.on_progress = on_progress  # called with 0..1 while saving
         self.on_notice = on_notice  # called with a message if a device is lost
-        
+        self.on_started = on_started
+
+        # The track list is the source of truth. mic_id/source_mode are the
+        # older single-source interface and are mapped onto a matching list.
+        self.tracks = normalize_tracks(tracks if tracks is not None
+                                       else tracks_from_mode(mic_id, source_mode))
+        self.output_mode = normalize_output_mode(output_mode)
+
         self.recording = False
         self.stop_event = threading.Event()
         self.error_message = None
         self.final_filepath = None
-        
+        self.final_filepaths = []
+        self.track_labels = []
+
         # Temp files
         self.temp_files = []
         self.recorders = []
 
-    def _get_device(self, is_loopback):
-        if is_loopback:
-            default_speaker = sc.default_speaker()
-            mics = sc.all_microphones(include_loopback=True)
-            loopback_mic = next((m for m in mics if m.name == default_speaker.name), None)
-            if not loopback_mic:
-                loopback_mic = next((m for m in mics if default_speaker.name in m.name), None)
-            if not loopback_mic:
-                available = [m.name for m in mics if m.isloopback] if any(hasattr(m, 'isloopback') for m in mics) else [m.name for m in mics]
+    def _get_loopback_for(self, speaker_id=None):
+        """The loopback device that mirrors the given (or default) speaker."""
+        if speaker_id:
+            speakers = sc.all_speakers()
+            speaker = next((s for s in speakers if s.id == speaker_id), None)
+            if speaker is None:
                 raise Exception(
-                    f"No loopback device found for speaker '{default_speaker.name}'. "
-                    f"Available loopback devices: {available}"
+                    f"Speaker '{speaker_id}' not found. "
+                    f"Available: {[s.name for s in speakers]}"
                 )
-            return loopback_mic
         else:
-            try:
-                return sc.get_microphone(self.mic_id, include_loopback=False)
-            except Exception as e:
-                available = [m.name for m in sc.all_microphones()]
-                raise Exception(
-                    f"Microphone '{self.mic_id}' not found ({e}). "
-                    f"Available: {available}"
-                ) from e
+            speaker = sc.default_speaker()
+
+        mics = sc.all_microphones(include_loopback=True)
+        loopback_mic = next((m for m in mics if m.name == speaker.name), None)
+        if not loopback_mic:
+            loopback_mic = next((m for m in mics if speaker.name in m.name), None)
+        if not loopback_mic:
+            available = [m.name for m in mics if getattr(m, 'isloopback', False)]
+            raise Exception(
+                f"No loopback device found for speaker '{speaker.name}'. "
+                f"Available loopback devices: {available}"
+            )
+        return loopback_mic
+
+    def _get_input_device(self, input_id=None):
+        try:
+            return sc.get_microphone(input_id, include_loopback=False)
+        except Exception as e:
+            available = [m.name for m in sc.all_microphones()]
+            raise Exception(
+                f"Microphone '{input_id}' not found ({e}). "
+                f"Available: {available}"
+            ) from e
+
+    def _get_track_device(self, track):
+        if track["kind"] == TRACK_KIND_INPUT:
+            return self._get_input_device(track.get("input_id"))
+        if track["kind"] == TRACK_KIND_OUTPUT:
+            return self._get_loopback_for(track.get("speaker_id"))
+        raise ValueError("Application tracks are captured by ProcTapRecorder")
+
+    def _get_device(self, is_loopback):
+        """Legacy helper for the older mic/loopback mode interface."""
+        if is_loopback:
+            return self._get_loopback_for()
+        return self._get_input_device(self.mic_id)
 
     def run(self):
         self.recording = True
         self.error_message = None
         self.temp_files = []
         self.recorders = []
-        
+        self.track_labels = []
+        self.final_filepaths = []
+
         try:
-            # 1. Setup Recorders
-            if self.source_mode == "both":
-                # Need two recorders
-                dev_mic = self._get_device(is_loopback=False)
-                dev_loop = self._get_device(is_loopback=True)
-                
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                t2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1, t2]
-                
-                self.recorders.append(RawRecorder(dev_mic, t1))
-                self.recorders.append(RawRecorder(dev_loop, t2))
-                
-            elif self.source_mode == "loopback":
-                dev = self._get_device(is_loopback=True)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
-                
-            else: # mic
-                dev = self._get_device(is_loopback=False)
-                t1 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                self.temp_files = [t1]
-                self.recorders.append(RawRecorder(dev, t1))
+            # 1. Setup Recorders - one per configured track. Labels get a
+            # number when a kind repeats, so two tracks never share a filename.
+            kind_counts = {}
+            for track in self.tracks:
+                kind_counts[track["kind"]] = kind_counts.get(track["kind"], 0) + 1
+            seen = {}
+            for track in self.tracks:
+                label = TRACK_LABELS.get(track["kind"], "track")
+                if kind_counts[track["kind"]] > 1:
+                    seen[label] = seen.get(label, 0) + 1
+                    label = "%s%d" % (label, seen[label])
+                self.track_labels.append(label)
+
+                temp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+                self.temp_files.append(temp_path)
+                if track["kind"] == TRACK_KIND_APP:
+                    # proc-tap includes descendants of the selected process.
+                    # Walking to an OS/launcher ancestor captures unrelated apps.
+                    self.recorders.append(ProcTapRecorder(
+                        track.get("target_pid"), temp_path,
+                        name=track.get("target_name") or None))
+                else:
+                    device = self._get_track_device(track)
+                    self.recorders.append(RawRecorder(device, temp_path))
 
             # Probe before starting so both sources start close together.
             # The loopback gets asked for the mic's rate first, so mixing
             # rarely has to resample.
             for r in self.recorders:
+                if isinstance(r, ProcTapRecorder):
+                    continue  # application capture has a fixed format
                 if r is not self.recorders[0]:
                     r.samplerate = self.recorders[0].samplerate
                 try:
@@ -218,12 +498,42 @@ class AudioRecorder(threading.Thread):
                 except Exception as e:
                     raise Exception(f"Recording failed on '{r.device.name}': {e}") from e
 
-            print(f"Starting recording mode: {self.source_mode}")
+            print(f"Starting recording with {len(self.recorders)} track(s): "
+                  f"{', '.join(self.track_labels)}")
 
-            # 2. Start Recording
+            # Initialize native application capture before starting hardware or
+            # announcing recording. Spawn/import latency is preparation, not
+            # silent audio at the beginning of the session.
+            session_started = threading.Event()
             for r in self.recorders:
-                r.start()
-            
+                if isinstance(r, ProcTapRecorder):
+                    r.session_started = session_started
+                    r.start()
+            for r in self.recorders:
+                ready = getattr(r, "ready_event", None)
+                if ready is None:
+                    continue
+                deadline = time.monotonic() + 15
+                while not ready.wait(0.05):
+                    if self.stop_event.is_set():
+                        return
+                    if not r.is_alive():
+                        break  # Preserve the other tracks; report this failure on save.
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Application capture did not become ready.")
+            if self.stop_event.is_set():
+                return
+            epoch = time.monotonic()
+            for r in self.recorders:
+                if isinstance(r, ProcTapRecorder):
+                    r.session_epoch = epoch
+            session_started.set()
+            for r in self.recorders:
+                if not isinstance(r, ProcTapRecorder):
+                    r.start()
+            if self.on_started:
+                self.on_started()
+
             # 3. Wait for the stop signal. A recorder only ends on its own when
             # its device is lost, then stop and save what was captured so far.
             while not self.stop_event.wait(0.5):
@@ -246,12 +556,44 @@ class AudioRecorder(threading.Thread):
                 os.makedirs(self.output_folder)
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"Recording_{timestamp}.{self.output_format}"
-            self.final_filepath = os.path.join(self.output_folder, filename)
 
-            sources = [sf.SoundFile(t) for t in self.temp_files]
+            # A track that captured nothing usable - a failed application
+            # capture, for instance - must not cost us the tracks that worked.
+            usable = []
+            for temp_path, label in zip(self.temp_files, self.track_labels):
+                try:
+                    if os.path.getsize(temp_path) > 0:
+                        usable.append((sf.SoundFile(temp_path), label))
+                except Exception:
+                    continue
+            if not usable:
+                raise Exception("No audio was captured from any track")
+
+            sources = [source for source, _ in usable]
+            labels = [label for _, label in usable]
+
             try:
-                self._write_output(sources, self.final_filepath)
+                if self.output_mode == "separate_files" and len(sources) > 1:
+                    # Keep one file per track, all at the shared mix rate so
+                    # they describe the same span and can be re-mixed later.
+                    mix_rate, _, mix_length, ratios = self._plan_mix(sources)
+                    self.final_filepaths = []
+                    for source, label, ratio in zip(sources, labels, ratios):
+                        path = os.path.join(
+                            self.output_folder,
+                            f"Recording_{timestamp}_{label}.{self.output_format}")
+                        self._write_output([source], path, samplerate=mix_rate,
+                                           mix_plan=(mix_rate, source.channels, mix_length, [ratio]))
+                        self.final_filepaths.append(path)
+                        # Keep earlier outputs visible if a later encoder fails.
+                        self.final_filepath = list(self.final_filepaths)
+                else:
+                    path = os.path.join(
+                        self.output_folder,
+                        f"Recording_{timestamp}.{self.output_format}")
+                    self._write_output(sources, path)
+                    self.final_filepaths = [path]
+                    self.final_filepath = path
             finally:
                 for s in sources:
                     s.close()
@@ -265,20 +607,23 @@ class AudioRecorder(threading.Thread):
             print(f"Error during recording process: {e}")
         finally:
             self.recording = False
+            for recorder in self.recorders:
+                if recorder.is_alive():
+                    recorder.stop()
             # Clean up all temp files
             for t in self.temp_files:
                 if os.path.exists(t):
                     try:
                         os.remove(t)
                     except: pass
-                
+
             if self.callback:
                 self.callback(self.final_filepath, self.error_message)
 
     def stop(self):
         self.stop_event.set()
 
-    def _plan_mix(self, sources):
+    def _plan_mix(self, sources, samplerate=None):
         """Output rate, channels and length, plus a read ratio per source.
 
         The first source (the mic in "both" mode) sets the rate. A source
@@ -286,7 +631,7 @@ class AudioRecorder(threading.Thread):
         which fixes clock drift between devices on long recordings instead
         of letting mic and system audio slowly drift apart.
         """
-        samplerate = sources[0].samplerate
+        samplerate = samplerate or sources[0].samplerate
         channels = max(s.channels for s in sources)
         lengths = [s.frames * samplerate / s.samplerate for s in sources]
         length = int(round(max(lengths)))
@@ -323,8 +668,8 @@ class AudioRecorder(threading.Thread):
             data = np.concatenate((data, np.zeros((count - len(data), data.shape[1]), dtype='float32')))
         return data
 
-    def _mixed_blocks(self, sources, gains=None, block=65536):
-        samplerate, channels, length, ratios = self._plan_mix(sources)
+    def _mixed_blocks(self, sources, gains=None, block=65536, samplerate=None, mix_plan=None):
+        samplerate, channels, length, ratios = mix_plan or self._plan_mix(sources, samplerate)
         gains = gains or [1.0] * len(sources)
         for start in range(0, length, block):
             count = min(block, length - start)
@@ -334,8 +679,8 @@ class AudioRecorder(threading.Thread):
                 mixed += g * self._read_block(s, start, count, ratio)
             yield np.clip(mixed, -1.0, 1.0)
 
-    def _write_output(self, sources, path):
-        samplerate, channels, length, _ = self._plan_mix(sources)
+    def _write_output(self, sources, path, samplerate=None, mix_plan=None):
+        samplerate, channels, length, _ = mix_plan or self._plan_mix(sources, samplerate)
         per_source = self.normalize and len(sources) > 1
 
         # progress over all passes: per-source peaks, mix peak, final write.
@@ -366,10 +711,10 @@ class AudioRecorder(threading.Thread):
                 peak = max((np.abs(tick(b)).max() for b in s.blocks(65536, dtype='float32')), default=0)
                 source_gains.append(1.0 / peak if peak > 0 else 1.0)
 
-        blocks = lambda: self._mixed_blocks(sources, source_gains)
+        blocks = lambda: self._mixed_blocks(sources, source_gains, samplerate=samplerate, mix_plan=mix_plan)
         if self.mono and channels > 1:
             channels = 1
-            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains))
+            blocks = lambda: (b.mean(axis=1, keepdims=True) for b in self._mixed_blocks(sources, source_gains, samplerate=samplerate, mix_plan=mix_plan))
 
         gain = 1.0
         if self.normalize:
@@ -390,10 +735,22 @@ class AudioRecorder(threading.Thread):
                     f_mp3.write(encoder.encode(pcm.tobytes()))
                 f_mp3.write(encoder.flush())
         else:
-            # WAV or FLAC, soundfile picks the container from the extension
-            with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels) as f_out:
+            # The temporary output path may not have the final extension.
+            output_format = "FLAC" if self.output_format == "flac" else "WAV"
+            subtype = "PCM_16" if self.output_format == "wav" else None
+            with sf.SoundFile(path, 'w', samplerate=samplerate, channels=channels,
+                              format=output_format, subtype=subtype) as f_out:
                 for b in blocks():
                     f_out.write(tick(b, write_cost) * gain)
+
+def get_speakers():
+    """Speakers available for system-audio tracks, as id/name pairs."""
+    try:
+        return [{"id": s.id, "name": s.name} for s in sc.all_speakers()]
+    except Exception as e:
+        print(f"Error fetching speakers: {e}")
+        return []
+
 
 def get_devices(include_loopback=False):
     try:

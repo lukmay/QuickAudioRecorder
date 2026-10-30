@@ -35,9 +35,13 @@ AI-generated PRs are not rejected on principle, but they tend to over-engineer a
 ## Development setup
 
 ```bash
-pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard
+pip install PyQt6 soundcard sounddevice soundfile numpy lameenc keyboard psutil pywin32
 python main.py
 ```
+
+For application-audio tracks and native release artifacts, follow [BUILDING.md](BUILDING.md).
+It includes the verified proc-tap source build, pinned x64/ARM64 dependencies and
+required architecture/runtime checks.
 
 Run the tests before sending a PR:
 
@@ -48,10 +52,8 @@ python -m pytest
 
 For the standalone build:
 
-```bash
-pip install pyinstaller
-pyinstaller --noconsole --onefile --noupx --name QuickAudioRecorder main.py
-```
+Use the native packaging recipe in [BUILDING.md](BUILDING.md), including its
+PyInstaller hooks. A successful cross-build is not native ARM64 runtime verification.
 
 ## Review timeline
 

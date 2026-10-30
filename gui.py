@@ -1,19 +1,58 @@
-import sys
-import os
+import ctypes
 import json
+import os
 import shutil
+import sys
 import tempfile
 import time
-from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, QMainWindow, 
-                             QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, 
-                             QPushButton, QFileDialog, QMessageBox, QGroupBox, 
-                             QLineEdit, QFormLayout, QCheckBox, QSpinBox)
-from PyQt6.QtGui import QIcon, QAction, QColor, QPixmap, QPainter, QBrush, QKeySequence
-from PyQt6.QtCore import pyqtSignal, QObject, Qt, QUrl, QMimeData, QDir, QEvent, QTimer
-import soundcard as sc
+
 import keyboard
-from audio_recorder import AudioRecorder, get_devices
+import soundcard as sc
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+from audio_recorder import AudioRecorder, get_devices, get_speakers
 from clipboard_utils import copy_file_to_clipboard
+from process_utils import get_active_applications, get_foreground_window_info
 
 CONFIG_FILE = "settings.json"
 
@@ -25,11 +64,12 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 class SignalManager(QObject):
-    recording_finished = pyqtSignal(str, str)
+    recording_finished = pyqtSignal(object, str)  # a path, or a list when tracks are separate
     saving = pyqtSignal()
     progress = pyqtSignal(float)
     hotkey = pyqtSignal(str)
     recording_notice = pyqtSignal(str)  # device lost while recording
+    recording_started = pyqtSignal()
 
 class HotkeyEdit(QLineEdit):
     """
@@ -39,7 +79,7 @@ class HotkeyEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setPlaceholderText("Click to set hotkey...")
-        self.setReadOnly(True) 
+        self.setReadOnly(True)
         self.current_sequence = None
 
     def mousePressEvent(self, event):
@@ -57,12 +97,12 @@ class HotkeyEdit(QLineEdit):
     def keyPressEvent(self, event):
         key = event.key()
         modifiers = event.modifiers()
-        
+
         if key == Qt.Key.Key_Backspace or key == Qt.Key.Key_Delete:
             self.clear()
             self.current_sequence = None
             return
-            
+
         if key == Qt.Key.Key_Escape:
             self.clearFocus()
             return
@@ -98,11 +138,789 @@ class HotkeyEdit(QLineEdit):
 
         if key_text:
             parts.append(key_text)
-            
+
         final_hotkey = "+".join(parts)
         self.setText(final_hotkey)
         self.current_sequence = final_hotkey
         self.clearFocus()
+
+def window_thumbnail(hwnd, width=48, height=32):
+    """Capture a small screenshot of the given window as a QIcon.
+
+    Mirrors how OBS captures windows: the primary method is a GDI ``BitBlt`` of
+    the window's own device context (captures the real window, never the
+    desktop, with no cropping or overlap). A desktop-DC crop at the window's
+    exact rectangle is used only as a fallback for windows where that BitBlt
+    comes back blank (e.g. GPU-composited content). Returns None when the window
+    can't be captured.
+    """
+    if not hwnd:
+        return None
+    # PrintWindow with PW_RENDERFULLCONTENT is the OBS "Windows 10" capture
+    # method: it asks the target to paint its full content (including GPU
+    # composited clients like Chrome/Vivaldi/Discord) into our DC, so it captures
+    # the real window -- never the desktop -- with no cropping or overlap, and
+    # works while the window is behind others. This is prioritized over BitBlt,
+    # which returns a blank bitmap for most modern windows.
+    image = _printwindow_image(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    image = _bitblt_window_image(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    image = _bitblt_desktop_rect(hwnd, width, height)
+    if _is_good_image(image):
+        return QIcon(QPixmap.fromImage(image))
+    return None
+
+
+def _is_good_image(image):
+    """True when ``image`` is a usable, non-blank capture."""
+    return image is not None and not image.isNull() and not _is_uniform_image(image)
+
+
+def _bitblt_window_image(hwnd, width, height):
+    """Capture ``hwnd`` by BitBlt-ing its window device context.
+
+    This is the OBS-proven GDI method: ``GetWindowDC`` + ``BitBlt`` of the
+    window's own content into a memory bitmap, converted to a ``QImage``. It
+    captures the actual window (never the desktop) and works across monitors.
+
+    Returns None on any failure so callers fall back to the desktop-DC crop.
+    """
+    try:
+        import win32con
+        import win32gui
+        import win32ui
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), win32con.SRCCOPY)
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+def _printwindow_image(hwnd, width, height):
+    """Capture ``hwnd`` with ``PrintWindow`` (PW_RENDERFULLCONTENT).
+
+    This is the technique OBS and Chromium use for windows where a GDI
+    ``BitBlt`` hands back a blank bitmap -- GPU-composited clients (Chrome,
+    Discord, Vivaldi), occluded, or minimized windows. ``PrintWindow`` asks the
+    target to paint its full content (including the client area) into our memory
+    DC, so it captures the real window and not the desktop, with no cropping or
+    overlap, and works even when the window is behind others.
+
+    pywin32 does not expose ``PrintWindow``, so we call ``user32.PrintWindow``
+    directly via ctypes.
+
+    Returns None on any failure.
+    """
+    hwnd = int(hwnd)
+    try:
+        import ctypes
+
+        import win32gui
+        import win32ui
+
+        user32 = ctypes.windll.user32
+        user32.PrintWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        user32.PrintWindow.restype = ctypes.c_int
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            dest = int(save_dc.GetSafeHdc())
+            # PW_RENDERFULLCONTENT (2) asks the app to render its full client
+            # area; fall back to the plain (0) variant if it is unsupported.
+            if not user32.PrintWindow(hwnd, dest, 2) and not user32.PrintWindow(
+                hwnd, dest, 0
+            ):
+                return None
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+def _is_uniform_image(image):
+    """Return True when ``image`` is blank (a single solid colour).
+
+    PrintWindow frequently hands back an all-black or all-white bitmap for
+    GPU-composited windows; such a result should be discarded in favour of a
+    screen grab.
+    """
+    if image is None or image.isNull():
+        return True
+    try:
+        converted = image.convertToFormat(QImage.Format.Format_RGB32)
+    except Exception:
+        return True
+    width = converted.width()
+    height = converted.height()
+    if width == 0 or height == 0:
+        return True
+    first = converted.pixelColor(0, 0)
+    target = (first.red(), first.green(), first.blue())
+    for y in range(height):
+        for x in range(width):
+            color = converted.pixelColor(x, y)
+            if (color.red(), color.green(), color.blue()) != target:
+                return False
+    return True
+
+
+def _bitblt_desktop_rect(hwnd, width, height):
+    """Fallback capture: BitBlt the desktop DC at the window's exact rect.
+
+    When a direct ``BitBlt`` of the window's own DC comes back blank (GPU
+    composited windows, etc.) the desktop device context still holds the
+    composited result for the region the window occupies, so sampling that
+    region recovers the content. The crop is the window's real rectangle, so it
+    is accurate with no overlap or guesswork.
+
+    Returns None on any failure.
+    """
+    try:
+        import win32con
+        import win32gui
+        import win32ui
+    except Exception:
+        return None
+    try:
+        if win32gui.IsIconic(hwnd):
+            rect = win32gui.GetWindowPlacement(hwnd)[4]
+        else:
+            rect = win32gui.GetWindowRect(hwnd)
+        left, top = rect[0], rect[1]
+        w = max(1, rect[2] - rect[0])
+        h = max(1, rect[3] - rect[1])
+        desktop_dc = win32gui.GetDC(0)
+        if not desktop_dc:
+            return None
+        try:
+            mfc_dc = win32ui.CreateDCFromHandle(desktop_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bitmap)
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (left, top), win32con.SRCCOPY)
+            bmp_info = bitmap.GetInfo()
+            bmp_str = bitmap.GetBitmapBits(True)
+        finally:
+            win32gui.ReleaseDC(0, desktop_dc)
+            try:
+                mfc_dc.DeleteDC()
+            except Exception:
+                pass
+            try:
+                save_dc.DeleteDC()
+            except Exception:
+                pass
+        if not bmp_str:
+            return None
+        image = QImage(
+            bmp_str,
+            w,
+            h,
+            bmp_info["bmWidthBytes"],
+            QImage.Format.Format_RGB32,
+        )
+        if image.isNull():
+            return None
+        return image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    except Exception:
+        return None
+
+
+
+_DWM_TNP_RECTDESTINATION = 0x00000001
+_DWM_TNP_OPACITY = 0x00000004
+_DWM_TNP_VISIBLE = 0x00000008
+_DWM_TNP_SOURCECLIENTAREAONLY = 0x00000010
+
+# DWM draws the source window straight onto our dialog. That removes the per-second
+# PrintWindow/BitBlt capture that made the picker laggy. The struct layout
+# below mirrors the native DWM_THUMBNAIL_PROPERTIES (DWORD, RECT, RECT, BYTE,
+# BOOL, BOOL) so ctypes packs it correctly.
+try:
+    _dwmapi = ctypes.windll.dwmapi
+    _DWM_AVAILABLE = True
+except Exception:
+    _dwmapi = None
+    _DWM_AVAILABLE = False
+
+
+class _DwmRect(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _DwmThumbnailProps(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", ctypes.c_uint32),
+        ("rcDestination", _DwmRect),
+        ("rcSource", _DwmRect),
+        ("opacity", ctypes.c_byte),
+        ("fVisible", ctypes.c_int32),
+        ("fSourceClientAreaOnly", ctypes.c_int32),
+    ]
+
+
+
+class AppPickerDialog(QDialog):
+    THUMBNAIL_SIZE = (240, 150)
+
+    def __init__(self, parent=None, recency=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Application to Capture")
+        self.setMinimumSize(360, 460)
+        self.resize(1000, 560)
+        self.setWindowIcon(QIcon(resource_path("icon_rec.png")))
+        self._recency = recency or {}
+        self._loading = True
+        self.selected_pid = None
+        self.selected_hwnd = None
+        self.selected_title = ""
+        self.selected_name = ""
+
+        # Incremental state so refreshes never rebuild the whole list.
+        self._item_map = {}  # (pid, hwnd) -> QListWidgetItem
+        self._thumb_map = {}  # (pid, hwnd) -> DWM thumbnail handle
+        self._preview_map = {}  # (pid, hwnd) -> preview QLabel
+        self._static_times = {}  # (pid, hwnd) -> last static-capture time
+
+        layout = QVBoxLayout(self)
+        self.list = QListWidget()
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setMovement(QListWidget.Movement.Static)
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setSpacing(10)
+        self.list.setWordWrap(True)
+        self.list.setIconSize(QSize(*self.THUMBNAIL_SIZE))
+        self.list.itemClicked.connect(self._on_item_clicked)
+        layout.addWidget(self.list, 1)
+
+        hint = QLabel("Click a window to capture it. Close this window to cancel.")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(hint)
+
+        self._populate()
+        self._loading = False
+
+        # Re-enumerate running applications once per second so newly opened or
+        # closed windows surface without rebuilding the widget list.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(1000)
+        self._refresh_timer.timeout.connect(self._populate)
+        self._refresh_timer.start()
+
+        # Live DWM thumbnails are cheap to reposition, so refresh their geometry
+        # frequently. Static (PrintWindow) fallbacks are throttled separately.
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(100)
+        self._live_timer.timeout.connect(self._update_live_thumbnails)
+        self._live_timer.start()
+
+        self._static_timer = QTimer(self)
+        self._static_timer.setInterval(1500)
+        self._static_timer.timeout.connect(self._refresh_static_visible)
+        self._static_timer.start()
+
+    def _populate(self):
+        try:
+            apps = get_active_applications()
+        except Exception:
+            apps = []
+        apps = self._sort_apps(apps)
+
+        current = self.list.currentItem()
+        selected_key = (current.data(Qt.ItemDataRole.UserRole),
+                        current.data(Qt.ItemDataRole.UserRole + 1)) if current else None
+
+        seen = set()
+        for app in apps:
+            key = (app.get("pid"), app.get("hwnd"))
+            seen.add(key)
+            title = app.get("title", "")
+            name = app.get("name", "")
+            text = f"{title}\n{name}" if title else name
+            item = self._item_map.get(key)
+            if item is None:
+                item = QListWidgetItem(text)
+                item.setSizeHint(
+                    QSize(self.THUMBNAIL_SIZE[0] + 16, self.THUMBNAIL_SIZE[1] + 44)
+                )
+                item.setData(Qt.ItemDataRole.UserRole, app.get("pid"))
+                item.setData(Qt.ItemDataRole.UserRole + 1, app.get("hwnd"))
+                self.list.addItem(item)
+                widget = self._make_item_widget(key, text)
+                self.list.setItemWidget(item, widget)
+                self._item_map[key] = item
+                self._preview_map[key] = widget.findChild(QLabel, "preview")
+                if _DWM_AVAILABLE:
+                    self._register_thumb(key, app.get("hwnd"))
+            else:
+                item.setText(text)
+                widget = self.list.itemWidget(item)
+                if widget is not None:
+                    label = widget.findChild(QLabel, "label")
+                    if label is not None:
+                        label.setText(text)
+            if key == selected_key:
+                self.list.setCurrentItem(item)
+
+        # Drop windows that disappeared since the last refresh.
+        for key in list(self._item_map):
+            if key not in seen:
+                item = self._item_map.pop(key)
+                self._unregister_thumb(key)
+                self._preview_map.pop(key, None)
+                self._static_times.pop(key, None)
+                row = self.list.row(item)
+                if row >= 0:
+                    self.list.takeItem(row)
+
+    def _sort_apps(self, apps):
+        # The foreground window is the most recently interacted app; boost it so
+        # it floats to the top. The picker itself becomes foreground when shown,
+        # so ignore our own window handle.
+        fg_hwnd, fg_pid = get_foreground_window_info()
+        own_hwnd = int(self.winId()) if self.winId() else 0
+        if fg_hwnd == own_hwnd:
+            fg_pid = None
+        for app in apps:
+            app["_fg"] = 1 if app.get("pid") == fg_pid else 0
+
+        groups = {}
+        for app in apps:
+            groups.setdefault(app.get("name", ""), []).append(app)
+
+        # Order each executable group by the most-recently-interacted window it
+        # contains (falling back to process creation time). Then interleave the
+        # groups round-robin so windows belonging to the same executable are not
+        # listed consecutively.
+        def group_key(items):
+            return (
+                max(a["_fg"] for a in items),
+                max(self._recency.get(a.get("pid"), 0.0) for a in items),
+                max(a.get("create_time", 0.0) for a in items),
+            )
+
+        ordered = sorted(groups.values(), key=group_key, reverse=True)
+        queues = [list(group) for group in ordered if group]
+        result = []
+        while queues:
+            next_round = []
+            for queue in queues:
+                result.append(queue.pop(0))
+                if queue:
+                    next_round.append(queue)
+            queues = next_round
+        return result
+
+    def _make_item_widget(self, key, text):
+        container = QWidget()
+        container.setFixedSize(self.THUMBNAIL_SIZE[0] + 16, self.THUMBNAIL_SIZE[1] + 44)
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(4, 4, 4, 4)
+        preview = QLabel()
+        preview.setObjectName("preview")
+        preview.setFixedSize(*self.THUMBNAIL_SIZE)
+        # Transparent so the OS-composited DWM live thumbnail shows through;
+        # when DWM is unavailable we paint a captured pixmap here instead.
+        preview.setStyleSheet("background:transparent; border:1px solid #555;")
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label = QLabel(text)
+        label.setObjectName("label")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        layout.addWidget(preview)
+        layout.addWidget(label)
+
+        def _press(event):
+            self._select(key)
+
+        container.mousePressEvent = _press
+        preview.mousePressEvent = _press
+        label.mousePressEvent = _press
+        return container
+
+    def _on_item_clicked(self, item):
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        hwnd = item.data(Qt.ItemDataRole.UserRole + 1)
+        self._select((pid, hwnd))
+
+    def _select(self, key, item=None):
+        if self._loading:
+            return
+        if item is None:
+            item = self._item_map.get(key)
+        if item is None:
+            return
+        self.list.setCurrentItem(item)
+        app_pid, app_hwnd = key
+        self.selected_pid = app_pid
+        self.selected_hwnd = app_hwnd
+        text = item.text().split("\n")
+        self.selected_title = text[0] if len(text) > 1 else ""
+        self.selected_name = text[-1]
+        self.accept()
+
+    # ── Live DWM thumbnails ──────────────────────────────────────────────────
+
+    def _register_thumb(self, key, hwnd):
+        if hwnd is None or not _DWM_AVAILABLE:
+            return
+        try:
+            handle = ctypes.c_void_p()
+            hr = _dwmapi.DwmRegisterThumbnail(
+                ctypes.c_void_p(int(self.winId())),
+                ctypes.c_void_p(int(hwnd)),
+                ctypes.byref(handle),
+            )
+            if hr == 0 and handle.value:
+                self._thumb_map[key] = handle.value
+        except Exception:
+            pass
+
+    def _unregister_thumb(self, key):
+        handle = self._thumb_map.pop(key, None)
+        if handle is None or not _DWM_AVAILABLE:
+            return
+        try:
+            _dwmapi.DwmUnregisterThumbnail(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+
+    def _update_live_thumbnails(self):
+        if not _DWM_AVAILABLE:
+            return
+        for key, item in list(self._item_map.items()):
+            preview = self._preview_map.get(key)
+            if preview is None or not preview.isVisible():
+                continue
+            handle = self._thumb_map.get(key)
+            if handle is None:
+                self._register_thumb(key, key[1])
+                handle = self._thumb_map.get(key)
+            if handle is None:
+                self._static_fallback(key, preview)
+                continue
+            top = preview.mapTo(self, QPoint(0, 0))
+            props = _DwmThumbnailProps()
+            props.dwFlags = (
+                _DWM_TNP_RECTDESTINATION
+                | _DWM_TNP_VISIBLE
+                | _DWM_TNP_SOURCECLIENTAREAONLY
+                | _DWM_TNP_OPACITY
+            )
+            props.rcDestination.left = top.x()
+            props.rcDestination.top = top.y()
+            props.rcDestination.right = top.x() + preview.width()
+            props.rcDestination.bottom = top.y() + preview.height()
+            props.opacity = 255
+            props.fVisible = True
+            props.fSourceClientAreaOnly = True
+            try:
+                _dwmapi.DwmUpdateThumbnailProperties(
+                    ctypes.c_void_p(handle), ctypes.byref(props)
+                )
+            except Exception:
+                self._unregister_thumb(key)
+                self._static_fallback(key, preview)
+
+    def _refresh_static_visible(self):
+        for key, item in list(self._item_map.items()):
+            if key in self._thumb_map:
+                continue
+            preview = self._preview_map.get(key)
+            if preview is None or not preview.isVisible():
+                continue
+            self._static_fallback(key, preview)
+
+    def _static_fallback(self, key, preview):
+        now = time.time()
+        last = self._static_times.get(key, 0.0)
+        if now - last < 1.5:
+            return
+        self._static_times[key] = now
+        icon = window_thumbnail(key[1], *self.THUMBNAIL_SIZE)
+        if icon is not None:
+            preview.setPixmap(icon.pixmap(*self.THUMBNAIL_SIZE))
+
+    def _cleanup(self):
+        self._refresh_timer.stop()
+        self._live_timer.stop()
+        self._static_timer.stop()
+        for key in list(self._thumb_map):
+            self._unregister_thumb(key)
+
+    def accept(self):
+        self._cleanup()
+        super().accept()
+
+    def reject(self):
+        self._cleanup()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._cleanup()
+        super().closeEvent(event)
+
+
+
+
+class TrackEditor(QWidget):
+    """One row of the track list: which source this track captures."""
+
+    KIND_INPUT = "Input Device"
+    KIND_OUTPUT = "Output (System Audio)"
+    KIND_APP = "Application"
+
+    removed = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loading = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.kind_combo = QComboBox()
+        self.kind_combo.addItems([self.KIND_INPUT, self.KIND_OUTPUT, self.KIND_APP])
+        self.kind_combo.currentIndexChanged.connect(self.on_kind_changed)
+        self.kind_combo.setFixedWidth(self.kind_combo.sizeHint().width())
+        layout.addWidget(self.kind_combo)
+
+        self.source_widget = QWidget()
+        source_layout = QHBoxLayout(self.source_widget)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.setSpacing(layout.spacing())
+        self.device_combo = QComboBox()
+        self.device_combo.setMinimumWidth(0)
+        self.device_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        source_layout.addWidget(self.device_combo, 1)
+        layout.addWidget(self.source_widget, 1)
+
+        self.app_btn = QPushButton("Choose App...")
+        self.app_btn.setToolTip("Capture one application's audio")
+        self.app_btn.clicked.connect(self.open_app_picker)
+        source_layout.addWidget(self.app_btn)
+        self.app_btn.hide()
+
+        btn_remove = QPushButton("Remove")
+        self.remove_btn = btn_remove
+        btn_remove.clicked.connect(lambda: self.removed.emit(self))
+        layout.addWidget(btn_remove)
+
+    def current_kind(self):
+        text = self.kind_combo.currentText()
+        if text == self.KIND_OUTPUT:
+            return "output"
+        if text == self.KIND_APP:
+            return "application"
+        return "input"
+
+    def on_kind_changed(self, _index=None):
+        if not self._loading:
+            self.refresh_devices(preserve_selection=False)
+
+    def refresh_devices(self, _checked=False, *, preserve_selection=True):
+        """Refresh choices without silently changing a configured source."""
+        selected = self.device_combo.currentData() if preserve_selection else None
+        selected_text = self.device_combo.currentText()
+        is_application = self.current_kind() == "application"
+        self.app_btn.setVisible(is_application)
+        self.app_btn.setEnabled(is_application)
+        self._loading = True
+        try:
+            self.device_combo.clear()
+            kind = self.current_kind()
+            if kind == "application":
+                # Applications come and go, so this list is always fetched fresh.
+                for app in get_active_applications():
+                    self.device_combo.addItem(self.app_text(app["title"], app["name"]), app["pid"])
+                return
+            if kind == "input":
+                for device in get_devices(include_loopback=False):
+                    self.device_combo.addItem(device["name"], device["id"])
+                default_id = sc.default_microphone().id
+            else:
+                for speaker in get_speakers():
+                    self.device_combo.addItem(speaker["name"], speaker["id"])
+                default_id = sc.default_speaker().id
+            index = self.device_combo.findData(default_id)
+            if index >= 0:
+                self.device_combo.setCurrentIndex(index)
+        except Exception as e:
+            print(f"Error refreshing devices: {e}")
+        finally:
+            if selected is not None:
+                index = self.device_combo.findData(selected)
+                if index < 0:
+                    self.device_combo.addItem(selected_text, selected)
+                    index = self.device_combo.count() - 1
+                self.device_combo.setCurrentIndex(index)
+            self._loading = False
+
+    @staticmethod
+    def app_text(title, name):
+        title, name = (title or "").strip(), (name or "").strip()
+        if title and name:
+            return f"{title} ({name})"
+        return title or name or "Unknown application"
+
+    def open_app_picker(self):
+        """Opens the application picker and adopts the chosen application."""
+        recency = getattr(self.parent(), "_app_recency", {}) or {}
+        dialog = AppPickerDialog(self, recency=recency)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_pid is not None:
+            self.set_app(dialog.selected_pid, dialog.selected_hwnd,
+                         dialog.selected_title, dialog.selected_name)
+
+    def set_app(self, pid, hwnd, title, name):
+        """Records the picked application and shows it on this row."""
+        if self.kind_combo.currentText() != self.KIND_APP:
+            self._loading = True
+            self.kind_combo.setCurrentText(self.KIND_APP)
+            self._loading = False
+            self.refresh_devices(preserve_selection=False)
+        label = self.app_text(title, name)
+        index = self.device_combo.findData(pid)
+        if index < 0:
+            self.device_combo.addItem(label, pid)
+            index = self.device_combo.count() - 1
+        else:
+            self.device_combo.setItemText(index, label)
+        self.device_combo.setCurrentIndex(index)
+
+    def get_track(self):
+        kind = self.current_kind()
+        if kind == "input":
+            return {"kind": "input", "input_id": self.device_combo.currentData()}
+        if kind == "output":
+            return {"kind": "output", "speaker_id": self.device_combo.currentData()}
+        return {"kind": "application",
+                "target_pid": self.device_combo.currentData(),
+                "target_name": self.device_combo.currentText()}
+
+    def set_track(self, track):
+        kind = str(track.get("kind") or "input").strip().lower()
+        label = {"output": self.KIND_OUTPUT, "application": self.KIND_APP}.get(kind, self.KIND_INPUT)
+        self._loading = True
+        self.kind_combo.setCurrentText(label)
+        self._loading = False
+        self.refresh_devices(preserve_selection=False)
+        if kind == "output":
+            wanted = track.get("speaker_id")
+        elif kind == "application":
+            wanted = track.get("target_pid")
+        else:
+            wanted = track.get("input_id")
+        if wanted is not None:
+            index = self.device_combo.findData(wanted)
+            if index < 0:
+                # Keep an unavailable source instead of silently recording another.
+                self.device_combo.addItem(f"Unavailable — select a device ({wanted})", wanted)
+                index = self.device_combo.count() - 1
+            self.device_combo.setCurrentIndex(index)
+
 
 class SettingsWindow(QMainWindow):
     settings_saved = pyqtSignal()
@@ -111,9 +929,11 @@ class SettingsWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("Settings - Simple Audio Recorder")
         self.setGeometry(100, 100, 500, 600)
-        
+
         self.init_ui()
         self.load_settings()
+        if not self.track_editors():
+            self.add_track()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -121,34 +941,47 @@ class SettingsWindow(QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
-        # Microphone
-        group_mic = QGroupBox("Input Device")
-        layout_mic = QVBoxLayout()
-        self.combo_mic = QComboBox()
-        layout_mic.addWidget(self.combo_mic)
+        # Tracks captured simultaneously
+        group_tracks = QGroupBox("Tracks")
+        layout_tracks = QVBoxLayout()
+        self.tracks_area = QScrollArea()
+        self.tracks_area.setWidgetResizable(True)
+        self.tracks_area.setMinimumHeight(110)
+        self.tracks_container = QWidget()
+        self.tracks_layout = QVBoxLayout(self.tracks_container)
+        self.tracks_layout.addStretch(1)
+        self.tracks_area.setWidget(self.tracks_container)
+        layout_tracks.addWidget(self.tracks_area)
+        btn_add_track = QPushButton("Add Track")
+        btn_add_track.clicked.connect(lambda: self.add_track())
+        layout_tracks.addWidget(btn_add_track)
         btn_refresh = QPushButton("Refresh Devices")
         btn_refresh.clicked.connect(self.refresh_devices)
-        layout_mic.addWidget(btn_refresh)
-        group_mic.setLayout(layout_mic)
-        layout.addWidget(group_mic)
+        layout_tracks.addWidget(btn_refresh)
+        group_tracks.setLayout(layout_tracks)
+        layout.addWidget(group_tracks)
 
         # Output
         group_out = QGroupBox("Output Configuration")
         layout_out = QFormLayout()
-        
+
         layout_folder_inner = QHBoxLayout()
         self.lbl_folder = QLabel(os.getcwd())
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self.browse_folder)
         layout_folder_inner.addWidget(self.lbl_folder)
         layout_folder_inner.addWidget(btn_browse)
-        
+
         self.combo_fmt = QComboBox()
         self.combo_fmt.addItems(["MP3", "WAV", "FLAC"])
         self.chk_mono = QCheckBox("Save as mono (half the size, good for voice)")
-        
+        self.combo_output_mode = QComboBox()
+        self.combo_output_mode.addItem("Mixed (one file)", "mixed")
+        self.combo_output_mode.addItem("Separate files", "separate_files")
+
         layout_out.addRow("Folder:", layout_folder_inner)
         layout_out.addRow("Format:", self.combo_fmt)
+        layout_out.addRow("Output mode:", self.combo_output_mode)
         layout_out.addRow("", self.chk_mono)
         group_out.setLayout(layout_out)
         layout.addWidget(group_out)
@@ -156,9 +989,6 @@ class SettingsWindow(QMainWindow):
         # Tray Interaction
         group_tray = QGroupBox("Tray Icon Behavior")
         layout_tray = QFormLayout()
-        self.combo_left_click = QComboBox()
-        self.combo_left_click.addItems(["Last Used", "Microphone", "Loopback", "Both"])
-        layout_tray.addRow("Left Click Action:", self.combo_left_click)
         self.spin_auto_stop = QSpinBox()
         self.spin_auto_stop.setRange(0, 24 * 60)
         self.spin_auto_stop.setSuffix(" min")
@@ -179,7 +1009,7 @@ class SettingsWindow(QMainWindow):
         self.chk_delete.setToolTip("Moves the file to the system temp folder before copying, keeping your output folder clean.")
         self.chk_delete.setEnabled(False)
         self.chk_clipboard.toggled.connect(lambda c: self.chk_delete.setEnabled(c))
-        
+
         layout_post.addWidget(self.chk_normalize)
         layout_post.addWidget(self.chk_clipboard)
         layout_post.addWidget(self.chk_delete)
@@ -189,14 +1019,12 @@ class SettingsWindow(QMainWindow):
         # Hotkeys
         group_hotkeys = QGroupBox("Global Hotkeys")
         layout_hotkeys = QFormLayout()
-        self.hk_mic = HotkeyEdit()
-        self.hk_loop = HotkeyEdit()
-        self.hk_both = HotkeyEdit()
+        self.hk_record = HotkeyEdit()
+        self.hk_toggle = HotkeyEdit()
         self.hk_stop = HotkeyEdit()
-        layout_hotkeys.addRow("Record Mic:", self.hk_mic)
-        layout_hotkeys.addRow("Record Loopback:", self.hk_loop)
-        layout_hotkeys.addRow("Record Both:", self.hk_both)
+        layout_hotkeys.addRow("Start Recording:", self.hk_record)
         layout_hotkeys.addRow("Stop Recording:", self.hk_stop)
+        layout_hotkeys.addRow("Toggle Recording:", self.hk_toggle)
         group_hotkeys.setLayout(layout_hotkeys)
         layout.addWidget(group_hotkeys)
 
@@ -207,18 +1035,44 @@ class SettingsWindow(QMainWindow):
         self.refresh_devices()
 
     def refresh_devices(self):
-        self.combo_mic.clear()
-        try:
-            mics = get_devices(include_loopback=False)
-            default_mic = sc.default_microphone()
-            default_index = 0
-            for i, m in enumerate(mics):
-                self.combo_mic.addItem(f"{m['name']}", m['id'])
-                if m['id'] == default_mic.id:
-                    default_index = i
-            self.combo_mic.setCurrentIndex(default_index)
-        except Exception as e:
-            print(f"Error refreshing devices: {e}")
+        for editor in self.track_editors():
+            editor.refresh_devices()
+
+    def add_track(self, track=None):
+        """Appends a track row, optionally seeded from a saved track dict."""
+        editor = TrackEditor()
+        editor.removed.connect(self.remove_track)
+        self.tracks_layout.insertWidget(self.tracks_layout.count() - 1, editor)
+        editor.refresh_devices()
+        if track:
+            editor.set_track(track)
+        return editor
+
+    def remove_track(self, editor):
+        if len(self.track_editors()) <= 1:
+            QMessageBox.information(self, "Tracks", "At least one track is required.")
+            return
+        self.tracks_layout.removeWidget(editor)
+        editor.setParent(None)
+        editor.deleteLater()
+
+    def track_editors(self):
+        """The live track rows, in display order."""
+        editors = []
+        for i in range(self.tracks_layout.count()):
+            widget = self.tracks_layout.itemAt(i).widget()
+            if isinstance(widget, TrackEditor):
+                editors.append(widget)
+        return editors
+
+    def clear_tracks(self):
+        for editor in self.track_editors():
+            self.tracks_layout.removeWidget(editor)
+            editor.setParent(None)
+            editor.deleteLater()
+
+    def get_tracks(self):
+        return [editor.get_track() for editor in self.track_editors()]
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", options=QFileDialog.Option.DontUseNativeDialog)
@@ -228,21 +1082,21 @@ class SettingsWindow(QMainWindow):
     def load_settings(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r') as f:
+                with open(CONFIG_FILE) as f:
                     data = json.load(f)
-                    
+
                 self.lbl_folder.setText(data.get("output_folder", os.getcwd()))
                 fmt_idx = self.combo_fmt.findText(data.get("format", "MP3"))
                 if fmt_idx >= 0: self.combo_fmt.setCurrentIndex(fmt_idx)
-                
-                saved_id = data.get("device_id")
-                if saved_id:
-                    idx = self.combo_mic.findData(saved_id)
-                    if idx >= 0: self.combo_mic.setCurrentIndex(idx)
 
-                mode = data.get("tray_click_mode", "Last Used")
-                mode_idx = self.combo_left_click.findText(mode)
-                if mode_idx >= 0: self.combo_left_click.setCurrentIndex(mode_idx)
+                self.clear_tracks()
+                for track in data.get("tracks") or []:
+                    self.add_track(track)
+                if not self.track_editors():
+                    self.add_track({"kind": "input", "input_id": data.get("device_id")})
+                mode_idx = self.combo_output_mode.findData(data.get("output_mode", "mixed"))
+                if mode_idx >= 0: self.combo_output_mode.setCurrentIndex(mode_idx)
+
                 self.spin_auto_stop.setValue(data.get("auto_stop_min", 0))
                 self.chk_notifications.setChecked(data.get("notifications", True))
 
@@ -252,9 +1106,11 @@ class SettingsWindow(QMainWindow):
                 self.chk_delete.setChecked(data.get("delete_after", False))
                 self.chk_delete.setEnabled(self.chk_clipboard.isChecked())
 
-                self.hk_mic.setText(data.get("hk_mic", ""))
-                self.hk_loop.setText(data.get("hk_loop", ""))
-                self.hk_both.setText(data.get("hk_both", ""))
+                # an older settings file could hold three per-mode hotkeys;
+                # keep the most useful one as the single record hotkey
+                self.hk_record.setText(data.get("hk_record",
+                                               data.get("hk_both") or data.get("hk_mic") or ""))
+                self.hk_toggle.setText(data.get("hk_toggle", ""))
                 self.hk_stop.setText(data.get("hk_stop", ""))
             except Exception as e:
                 print(f"Error loading settings: {e}")
@@ -270,20 +1126,22 @@ class SettingsWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to save settings: {e}")
 
     def get_settings(self):
+        tracks = self.get_tracks()
+        first_input = next((t.get("input_id") for t in tracks if t.get("kind") == "input"), None)
         return {
-            "device_id": self.combo_mic.currentData(),
+            "device_id": first_input,
+            "tracks": tracks,
+            "output_mode": self.combo_output_mode.currentData(),
             "output_folder": self.lbl_folder.text(),
             "format": self.combo_fmt.currentText(),
             "mono": self.chk_mono.isChecked(),
-            "tray_click_mode": self.combo_left_click.currentText(),
             "auto_stop_min": self.spin_auto_stop.value(),
             "notifications": self.chk_notifications.isChecked(),
             "normalize": self.chk_normalize.isChecked(),
             "clipboard": self.chk_clipboard.isChecked(),
             "delete_after": self.chk_delete.isChecked(),
-            "hk_mic": self.hk_mic.text(),
-            "hk_loop": self.hk_loop.text(),
-            "hk_both": self.hk_both.text(),
+            "hk_record": self.hk_record.text(),
+            "hk_toggle": self.hk_toggle.text(),
             "hk_stop": self.hk_stop.text()
         }
 
@@ -292,8 +1150,7 @@ class TrayApplication(QObject):
         super().__init__()
         self.app = app
         self.recorder = None
-        self.last_mode = "mic" 
-        
+
         self.signals = SignalManager()
         self.signals.recording_finished.connect(self.on_recording_finished)
         self.signals.saving.connect(self.on_saving)
@@ -301,6 +1158,7 @@ class TrayApplication(QObject):
         self.save_percent = -1
         self.signals.hotkey.connect(self.on_hotkey)
         self.signals.recording_notice.connect(self.on_recording_notice)
+        self.signals.recording_started.connect(self.on_recording_started)
 
         # ticks while recording: elapsed time in the tooltip, auto stop
         self.rec_timer = QTimer(self)
@@ -311,17 +1169,17 @@ class TrayApplication(QObject):
         self.icon_idle_path = resource_path("icon_idle.png")
         self.icon_rec_path = resource_path("icon_rec.png")
         self.generate_icons()
-            
+
         self.tray_icon = QSystemTrayIcon(QIcon(self.icon_idle_path), self.app)
         self.tray_icon.setToolTip("Simple Audio Recorder (Idle)")
         self.tray_icon.activated.connect(self.on_tray_activated)
-        
+
         self.build_menu()
         self.tray_icon.show()
-        
+
         self.settings_window = SettingsWindow()
         self.settings_window.settings_saved.connect(self.register_hotkeys)
-        
+
         self.notify("Ready", "Left-click to toggle recording.", QSystemTrayIcon.MessageIcon.Information, 2000)
         self.register_hotkeys()
 
@@ -352,12 +1210,9 @@ class TrayApplication(QObject):
 
     def build_menu(self):
         self.menu = QMenu()
-        self.action_record_mic = QAction("Start Recording (Mic)", self)
-        self.action_record_mic.triggered.connect(lambda: self.start_recording("mic"))
-        self.action_record_loop = QAction("Start Recording (Loopback)", self)
-        self.action_record_loop.triggered.connect(lambda: self.start_recording("loopback"))
-        self.action_record_both = QAction("Start Recording (Both)", self)
-        self.action_record_both.triggered.connect(lambda: self.start_recording("both"))
+        # One way in: the track list in Settings decides what gets captured.
+        self.action_record = QAction("Start Recording", self)
+        self.action_record.triggered.connect(lambda: self.start_recording())
         self.action_stop = QAction("Stop Recording", self)
         self.action_stop.triggered.connect(self.stop_recording)
         self.action_stop.setEnabled(False)
@@ -365,10 +1220,8 @@ class TrayApplication(QObject):
         self.action_settings.triggered.connect(self.open_settings)
         self.action_exit = QAction("Exit", self)
         self.action_exit.triggered.connect(self.exit_app)
-        
-        self.menu.addAction(self.action_record_mic)
-        self.menu.addAction(self.action_record_loop)
-        self.menu.addAction(self.action_record_both)
+
+        self.menu.addAction(self.action_record)
         self.menu.addAction(self.action_stop)
         self.menu.addSeparator()
         self.menu.addAction(self.action_settings)
@@ -379,24 +1232,23 @@ class TrayApplication(QObject):
         try: keyboard.unhook_all_hotkeys() # Ensure no old hotkeys are active
         except: pass
         settings = self.settings_window.get_settings()
-        hk_mic = settings.get("hk_mic")
-        hk_loop = settings.get("hk_loop")
-        hk_both = settings.get("hk_both")
+        hk_record = settings.get("hk_record")
+        hk_toggle = settings.get("hk_toggle")
         hk_stop = settings.get("hk_stop")
         try:
             # keyboard runs callbacks on its own thread, hand them to the Qt thread
-            if hk_mic: keyboard.add_hotkey(hk_mic, lambda: self.signals.hotkey.emit("mic"))
-            if hk_loop: keyboard.add_hotkey(hk_loop, lambda: self.signals.hotkey.emit("loopback"))
-            if hk_both: keyboard.add_hotkey(hk_both, lambda: self.signals.hotkey.emit("both"))
+            if hk_record: keyboard.add_hotkey(hk_record, lambda: self.signals.hotkey.emit("record"))
+            if hk_toggle: keyboard.add_hotkey(hk_toggle, lambda: self.signals.hotkey.emit("toggle"))
             if hk_stop: keyboard.add_hotkey(hk_stop, lambda: self.signals.hotkey.emit("stop"))
         except Exception as e: print(f"Failed to register hotkeys: {e}")
 
-    def on_hotkey(self, mode):
-        # a record hotkey pressed again stops the recording
-        if mode == "stop" or (self.recorder and self.recorder.is_alive()):
+    def on_hotkey(self, action):
+        # "toggle" flips recording, "record" only starts, "stop" only stops
+        recording = bool(self.recorder and self.recorder.is_alive())
+        if action == "stop" or (action == "toggle" and recording):
             self.stop_recording()
-        else:
-            self.start_recording(mode)
+        elif action in ("record", "toggle"):
+            self.start_recording()
 
     def notify(self, title, msg, icon=QSystemTrayIcon.MessageIcon.Information, ms=2000):
         if self.settings_window.chk_notifications.isChecked():
@@ -407,54 +1259,58 @@ class TrayApplication(QObject):
             if self.recorder and self.recorder.is_alive():
                 self.stop_recording()
             else:
-                settings = self.settings_window.get_settings()
-                click_mode = settings.get("tray_click_mode", "Last Used")
-                target_mode = self.last_mode
-                if click_mode == "Microphone": target_mode = "mic"
-                elif click_mode == "Loopback": target_mode = "loopback"
-                elif click_mode == "Both": target_mode = "both"
-                self.start_recording(target_mode)
+                # Left click toggles recording with the configured tracks.
+                self.start_recording()
 
     def open_settings(self):
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()
 
-    def start_recording(self, mode="mic"):
+    def start_recording(self, mode="tracks"):
         if self.recorder and self.recorder.is_alive(): return
-        self.last_mode = mode    
         settings = self.settings_window.get_settings()
         target_id = settings['device_id']
-        
+        use_tracks = mode == "tracks"
+
         def finish_callback(path, error):
             self.signals.recording_finished.emit(path if path else "", error if error else "")
 
+        # "tracks" records the configured track list; the older mic/loopback/
+        # both modes stay available as one-track shortcuts.
+        source = ({"tracks": settings.get("tracks")} if use_tracks
+                  else {"mic_id": target_id, "source_mode": mode})
         self.recorder = AudioRecorder(
-            mic_id=target_id,
-            source_mode=mode,
             output_folder=settings['output_folder'],
             output_format=settings['format'],
             normalize=settings['normalize'],
             mono=settings['mono'],
+            output_mode=settings.get('output_mode', 'mixed'),
             on_finish_callback=finish_callback,
             on_progress=self.signals.progress.emit,
-            on_notice=self.signals.recording_notice.emit
+            on_notice=self.signals.recording_notice.emit,
+            **source
         )
+        self.recorder.on_started = self.signals.recording_started.emit
         self.recorder.start()
-        self.action_record_mic.setEnabled(False)
-        self.action_record_loop.setEnabled(False)
-        self.action_record_both.setEnabled(False)
+        self.action_record.setEnabled(False)
         self.action_stop.setEnabled(True)
-        self.tray_icon.setIcon(QIcon(self.icon_rec_path)) 
-        self.tray_icon.setToolTip(f"Recording ({mode}) 00:00")
+        self.tray_icon.setIcon(QIcon(self.icon_rec_path))
+        self.tray_icon.setToolTip("Preparing audio capture...")
         self.rec_started = time.monotonic()
+
+    def on_recording_started(self):
+        if not self.recorder or self.recorder.stop_event.is_set():
+            return
+        self.rec_started = time.monotonic()
+        self.tray_icon.setToolTip("Recording 00:00")
         self.rec_timer.start()
-        self.notify("Started", f"Recording {mode}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
+        self.notify("Started", "Recording configured tracks", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
 
     def on_recording_tick(self):
         elapsed = int(time.monotonic() - self.rec_started)
         minutes, seconds = divmod(elapsed, 60)
-        self.tray_icon.setToolTip(f"Recording ({self.last_mode}) {minutes:02d}:{seconds:02d}")
+        self.tray_icon.setToolTip(f"Recording {minutes:02d}:{seconds:02d}")
         limit = self.settings_window.get_settings()["auto_stop_min"]
         if limit and elapsed >= limit * 60:
             self.stop_recording()
@@ -506,48 +1362,50 @@ class TrayApplication(QObject):
 
     def on_recording_finished(self, path, error):
         self.rec_timer.stop()
-        self.action_record_mic.setEnabled(True)
-        self.action_record_loop.setEnabled(True)
-        self.action_record_both.setEnabled(True)
+        self.action_record.setEnabled(True)
         self.action_stop.setEnabled(False)
         self.action_stop.setText("Stop Recording")
         self.tray_icon.setIcon(QIcon(self.icon_idle_path))
         self.tray_icon.setToolTip("Simple Audio Recorder (Idle)")
         self.recorder = None
-        
+
+        # separate-track mode finishes with a list; mixed mode with one path
+        paths = [p for p in (path if isinstance(path, (list, tuple)) else [path]) if p]
+
         # a partial recording comes back with a path and an error, keep it and warn
-        if error and not (path and os.path.exists(path)):
+        if error and not any(os.path.exists(p) for p in paths):
             self.tray_icon.showMessage("Error", f"Recording failed: {error}", QSystemTrayIcon.MessageIcon.Critical, 4000)
             return
-            
+
         settings = self.settings_window.get_settings()
-        final_path = path
-        msg = f"Saved to {os.path.basename(path)}"
+        if len(paths) == 1:
+            msg = f"Saved to {os.path.basename(paths[0])}"
+        else:
+            msg = "Saved %d tracks:\n%s" % (len(paths), "\n".join(os.path.basename(p) for p in paths))
         if error:
             msg += f"\nWarning: {error}"
-        
-        if settings['clipboard'] and os.path.exists(path):
+
+        keepers = [p for p in paths if os.path.exists(p)]
+        if settings['clipboard'] and keepers:
             try:
                 if settings['delete_after']:
                     temp_dir = tempfile.gettempdir()
-                    new_path = os.path.join(temp_dir, os.path.basename(path))
-                    if os.path.exists(new_path):
-                        base, ext = os.path.splitext(new_path)
-                        new_path = f"{base}_{int(time.time())}{ext}"
-                    shutil.move(path, new_path)
-                    final_path = new_path
+                    moved = []
+                    for p in keepers:
+                        new_path = os.path.join(temp_dir, os.path.basename(p))
+                        if os.path.exists(new_path):
+                            base, ext = os.path.splitext(new_path)
+                            new_path = f"{base}_{int(time.time())}{ext}"
+                        shutil.move(p, new_path)
+                        moved.append(new_path)
+                    keepers = moved
                     msg = "Moved to Temp & Copied to Clipboard."
-                else:
-                    msg += "\nCopied to clipboard."
 
-                # Use Robust Clipboard Utility
-                success, status = copy_file_to_clipboard(final_path)
+                success, status = copy_file_to_clipboard(keepers)
                 if not success:
                     msg += f"\nClipboard Error: {status}"
-                else:
-                    # Optional: Log success?
-                    pass
-                
+                if not settings['delete_after']:
+                    msg += "\nCopied to clipboard."
             except Exception as e:
                 msg += f"\nClipboard/Move error: {e}"
 

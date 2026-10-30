@@ -1,0 +1,293 @@
+"""Application tracks: capture through proc-tap, and failing gracefully."""
+import os
+import sys
+import threading
+import types
+
+import numpy as np
+import pytest
+import soundfile as sf
+from conftest import FakeDevice, dominant_freq
+from test_tracks import THREE_TRACKS, record_tracks
+
+import audio_recorder
+
+
+class FakeSender:
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+
+class StubAppRecorder(threading.Thread):
+    """Stands in for ProcTapRecorder: writes a 1000 Hz tone, then stops."""
+
+    def __init__(self, pid, filepath, name=None):
+        super().__init__()
+        self.pid = pid
+        self.filepath = filepath
+        self.device = types.SimpleNamespace(name=name or "application %s" % pid)
+        self.samplerate = audio_recorder.PROC_TAP_SAMPLERATE
+        self.channels = audio_recorder.PROC_TAP_CHANNELS
+        self.stop_event = threading.Event()
+        self.error = None
+        self.frames = 0
+
+    def probe(self):
+        pass
+
+    def run(self):
+        t = np.arange(int(2 * self.samplerate)) / self.samplerate
+        tone = 0.5 * np.sin(2 * np.pi * 1000 * t)
+        data = np.repeat(tone[:, None], self.channels, axis=1).astype(np.float32)
+        sf.write(self.filepath, data, self.samplerate, subtype="FLOAT")
+        self.frames = len(data)
+
+    def stop(self):
+        self.stop_event.set()
+        self.join()
+
+
+def mic_only_fake():
+    mic = FakeDevice("Mic A", freq=440.0, channels=1)
+    return types.SimpleNamespace(
+        default_microphone=lambda: mic,
+        default_speaker=lambda: types.SimpleNamespace(name="Speakers A", id="spk-a"),
+        all_speakers=lambda: [types.SimpleNamespace(name="Speakers A", id="spk-a")],
+        all_microphones=lambda include_loopback=False: [mic],
+        get_microphone=lambda id, include_loopback=False: mic,
+    )
+
+
+def test_decode_message_normalizes_both_shapes():
+    assert audio_recorder._decode_message(b"abc") == ("data", b"abc")
+    assert audio_recorder._decode_message(("data", b"x")) == ("data", b"x")
+    assert audio_recorder._decode_message(("error", "closed", "gone")) == ("error", "closed", "gone")
+
+
+def test_capture_worker_reports_a_missing_capture_library(monkeypatch):
+    """proc-tap absent must produce a report, not an exception."""
+    monkeypatch.setitem(sys.modules, "proctap", None)
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    sender = FakeSender()
+
+    audio_recorder._process_tap_worker(4242, sender)
+
+    assert sender.messages
+    kind, reason, detail = sender.messages[0]
+    assert kind == "error"
+    assert reason == "failed"
+    assert detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native isolation guard")
+@pytest.mark.parametrize("native", [None, types.SimpleNamespace(),
+                                     types.SimpleNamespace(is_process_specific=lambda: False)])
+def test_capture_worker_rejects_system_audio_fallback(monkeypatch, native):
+    stopped = []
+    capture = types.SimpleNamespace(
+        _backend=types.SimpleNamespace(_native=native),
+        start=lambda: pytest.fail("System-wide fallback must not start"),
+        stop=lambda: stopped.append(True))
+    monkeypatch.setitem(sys.modules, "proctap", types.SimpleNamespace(
+        ProcessAudioCapture=lambda pid: capture))
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    sender = FakeSender()
+    audio_recorder._process_tap_worker(4242, sender)
+    assert sender.messages[0][:2] == ("error", "failed")
+    assert "refusing system-wide" in sender.messages[0][2]
+    assert stopped == [True]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native isolation guard")
+def test_capture_worker_accepts_confirmed_process_isolation(monkeypatch):
+    capture = types.SimpleNamespace(
+        _backend=types.SimpleNamespace(_native=types.SimpleNamespace(
+            is_process_specific=lambda: True)),
+        start=lambda: None,
+        read=lambda **kw: (_ for _ in ()).throw(RuntimeError("test finished")),
+        stop=lambda: None)
+    monkeypatch.setitem(sys.modules, "proctap", types.SimpleNamespace(
+        ProcessAudioCapture=lambda pid: capture))
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    sender = FakeSender()
+    audio_recorder._process_tap_worker(4242, sender)
+    assert sender.messages[0][0] == "ready"
+    assert sender.messages[1] == ("error", "failed", "test finished")
+
+
+def test_hardware_only_recording_never_needs_the_capture_library(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "proctap", None)
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+
+    path, error = record_tracks(tmp_path, [THREE_TRACKS[0]], output_format="wav")
+
+    assert not error
+    assert isinstance(path, str)
+
+
+def test_an_application_track_keeps_its_own_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", StubAppRecorder)
+    tracks = [{"kind": "input", "input_id": "Mic A"},
+              {"kind": "application", "target_pid": 4242, "target_name": "Game"}]
+
+    paths, error = record_tracks(tmp_path, tracks, output_format="wav",
+                                 output_mode="separate_files")
+
+    assert not error
+    assert len(paths) == 2
+    app_file = next(p for p in paths if "application" in os.path.basename(p))
+    assert os.path.basename(app_file).endswith("_application.wav")
+    data, sr = sf.read(app_file)
+    assert abs(dominant_freq(data, sr) - 1000) < 10
+
+
+def test_application_capture_keeps_the_selected_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+    selected = []
+
+    class SelectedAppRecorder(StubAppRecorder):
+        def __init__(self, pid, filepath, name=None):
+            selected.append(pid)
+            super().__init__(pid, filepath, name)
+
+    import process_utils
+    monkeypatch.setattr(process_utils, "get_root_pid", lambda pid: 1)
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", SelectedAppRecorder)
+    path, error = record_tracks(tmp_path, [
+        {"kind": "application", "target_pid": 4242, "target_name": "Player"},
+    ], output_format="wav")
+    assert path and not error
+    assert selected == [4242]
+
+
+def test_started_callback_waits_for_application_readiness(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+    instances = []
+    prepared = threading.Event()
+    release = threading.Event()
+    started = threading.Event()
+
+    class PreparingAppRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            prepared.set()
+            release.wait(5)
+            self.ready_event.set()
+            super().run()
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", PreparingAppRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), output_format="wav",
+        tracks=[{"kind": "application", "target_pid": 4242}],
+        on_started=started.set)
+    rec.start()
+    try:
+        assert prepared.wait(5)
+        assert not started.is_set()
+        release.set()
+        assert started.wait(5)
+        assert instances[0].ready_event.is_set()
+    finally:
+        release.set()
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+
+
+def test_application_tracks_share_epoch_after_staggered_readiness(tmp_path, monkeypatch):
+    instances = []
+    first_ready = threading.Event()
+    release_second = threading.Event()
+    started = threading.Event()
+
+    class StaggeredRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            if self.pid == 2:
+                release_second.wait(5)
+            self.ready_event.set()
+            if self.pid == 1:
+                first_ready.set()
+            self.stop_event.wait(5)
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", StaggeredRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), tracks=[
+            {"kind": "application", "target_pid": 1},
+            {"kind": "application", "target_pid": 2}], on_started=started.set)
+    rec.start()
+    try:
+        assert first_ready.wait(5)
+        assert not started.is_set()
+        assert not instances[0].session_started.is_set()
+        release_second.set()
+        assert started.wait(5)
+        assert instances[0].session_epoch == instances[1].session_epoch
+        assert instances[0].session_epoch is not None
+        assert all(r.session_started.is_set() for r in instances)
+    finally:
+        release_second.set()
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+
+
+def test_stop_during_application_preparation_cleans_up(tmp_path, monkeypatch):
+    prepared = threading.Event()
+    started = threading.Event()
+    instances = []
+
+    class WaitingAppRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            prepared.set()
+            self.stop_event.wait(5)
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", WaitingAppRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), tracks=[{"kind": "application", "target_pid": 4242}],
+        on_started=started.set)
+    rec.start()
+    try:
+        assert prepared.wait(5)
+    finally:
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+    assert not started.is_set()
+    assert not instances[0].is_alive()
+    assert all(not os.path.exists(path) for path in rec.temp_files)
+
+
+def test_a_failing_application_track_is_reported_not_fatal(tmp_path, monkeypatch):
+    """The other tracks still save, and the failure surfaces as an error."""
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+
+    class BrokenAppRecorder(StubAppRecorder):
+        def run(self):
+            self.error = "The application stopped or exited."
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", BrokenAppRecorder)
+    tracks = [{"kind": "input", "input_id": "Mic A"},
+              {"kind": "application", "target_pid": 4242, "target_name": "Gone"}]
+
+    path, error = record_tracks(tmp_path, tracks, output_format="wav")
+
+    assert path, "the microphone track should still have been saved"
+    assert error and "Gone" in error

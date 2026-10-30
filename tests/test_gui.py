@@ -57,17 +57,17 @@ def test_stop_twice_is_harmless(tray):
 def test_hotkey_from_other_thread_toggles_recording(tray):
     import threading
     # keyboard fires hotkeys on its own thread
-    threading.Thread(target=lambda: tray.signals.hotkey.emit("mic")).start()
+    threading.Thread(target=lambda: tray.signals.hotkey.emit("toggle")).start()
     assert wait_for(lambda: tray.recorder is not None and tray.recorder.is_alive())
     time.sleep(0.2)
-    threading.Thread(target=lambda: tray.signals.hotkey.emit("mic")).start()
+    threading.Thread(target=lambda: tray.signals.hotkey.emit("toggle")).start()
     assert wait_for(lambda: tray.recorder is None)
 
 
 def test_hotkey_field_captures_alt_shift_letter(tray):
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
-    edit = tray.settings_window.hk_mic
+    edit = tray.settings_window.hk_record
     tray.settings_window.show()
     edit.setFocus()
     QTest.keyClick(edit, Qt.Key.Key_R, Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.ShiftModifier)
@@ -90,7 +90,8 @@ def test_tooltip_shows_elapsed_time(tray):
     tray.start_recording("mic")
     tray.rec_started -= 75
     tray.on_recording_tick()
-    assert tray.tray_icon.toolTip() == "Recording (mic) 01:15"
+    # the tray no longer carries a per-mode label, just the elapsed time
+    assert tray.tray_icon.toolTip() == "Recording 01:15"
 
 
 def test_auto_stop(tray):
@@ -114,6 +115,30 @@ def test_tray_shows_saving_progress(tray):
     assert wait_for(lambda: tray.recorder is None)
     assert tray.tray_icon.toolTip() == "Simple Audio Recorder (Idle)"
     assert tray.action_stop.text() == "Stop Recording"
+
+
+def test_recording_notification_waits_for_backend_readiness(tray, monkeypatch):
+    import threading
+    import types
+
+    shown = []
+    backend = types.SimpleNamespace(
+        start=lambda: None, stop_event=threading.Event(), on_started=None)
+    monkeypatch.setattr(gui, "AudioRecorder", lambda **kwargs: backend)
+    monkeypatch.setattr(tray, "notify", lambda title, *args: shown.append(title))
+    try:
+        tray.start_recording("mic")
+        assert tray.tray_icon.toolTip() == "Preparing audio capture..."
+        assert not tray.rec_timer.isActive()
+        assert "Started" not in shown
+        backend.on_started()
+        QApplication.instance().processEvents()
+        assert tray.rec_timer.isActive()
+        assert tray.tray_icon.toolTip() == "Recording 00:00"
+        assert shown == ["Started"]
+    finally:
+        tray.rec_timer.stop()
+        tray.recorder = None
 
 
 def test_saving_progress_updates_tooltip_and_menu(tray):
