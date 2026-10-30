@@ -128,6 +128,13 @@ class RawRecorder(threading.Thread):
         self.error = None
         self.frames = 0  # written so far, kept if the device is lost midway
 
+    def _open_stream(self, samplerate, channels):
+        # SoundCard's default WASAPI buffer can be shorter than one read.
+        # Leave scheduling headroom (VAIO3 drops packets with the default at
+        # 44.1 kHz) while keeping the existing 2048-frame read/stop cadence.
+        options = {} if isinstance(self.device, PortAudioDevice) else {"blocksize": 8192}
+        return self.device.recorder(samplerate=samplerate, channels=channels, **options)
+
     def _probe_params(self):
         """Find working (samplerate, channels) for this device."""
         channels = self.channels
@@ -142,7 +149,7 @@ class RawRecorder(threading.Thread):
         for sr in rates:
             for ch in channel_options:
                 try:
-                    with self.device.recorder(samplerate=sr, channels=ch):
+                    with self._open_stream(samplerate=sr, channels=ch):
                         return sr, ch
                 except Exception as e:
                     # soundcard raises a bare AssertionError for some mics, keep the type visible
@@ -167,7 +174,7 @@ class RawRecorder(threading.Thread):
         try:
             samplerate, channels = self.samplerate, self.channels
             with sf.SoundFile(self.filepath, mode='w', samplerate=samplerate, channels=channels) as f_wav:
-                with self.device.recorder(samplerate=samplerate, channels=channels) as mic:
+                with self._open_stream(samplerate=samplerate, channels=channels) as mic:
                     while not self.stop_event.is_set():
                         data = mic.record(numframes=2048)
                         f_wav.write(data)
