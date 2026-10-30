@@ -1,0 +1,31 @@
+# Windows native x64 / ARM64 build inputs (CPython 3.12).
+# proc-tap is built separately from verified source: scripts/build_proctap.ps1.
+PyQt6==6.12.0
+PyQt6-Qt6==6.12.0
+PyQt6-sip==13.13.0
+soundcard==0.4.6
+sounddevice==0.5.6
+soundfile==0.14.0
+numpy==2.5.4
+scipy==1.18.1
+lameenc==1.9.0
+keyboard==0.13.5
+psutil==7.2.2
+pywin32==312
+cffi==2.1.1
+pycparser==3.12
+typing-extensions==4.16.0
+pyinstaller==6.22.3
+pytest==9.2.0
+setuptools==80.9.0
+wheel==0.45.1
+# Resolved transitive build/test dependencies.
+altgraph==0.17.5
+colorama==0.4.6
+iniconfig==2.3.1
+packaging==26.3
+pefile==2024.8.26
+pluggy==1.7.0
+pygments==2.21.0
+pyinstaller-hooks-contrib==2026.9
+pywin32-ctypes==0.2.3

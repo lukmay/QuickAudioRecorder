@@ -97,7 +97,7 @@ The exe is built by [GitHub Actions](.github/workflows/release.yml) straight fro
 
 Hardware capture uses SoundCard's Windows input and loopback endpoints, with sounddevice as a fallback for microphones that SoundCard cannot open. Capture is streamed to temporary WAV files before output encoding.
 
-The application-source track uses the optional `proc-tap` distribution (`proctap` import). Install it with `pip install proc-tap` before freezing to include application capture. If it is missing or capture fails, the recording reports an explicit error and preserves any usable hardware tracks. The release workflow does not currently bundle this optional dependency. Version 1.1.1 provides Windows x64 native wheels but no Windows ARM64 native wheel; native ARM64 application capture remains unverified.
+The application-source track uses the `proc-tap` distribution (`proctap` import). The release workflow builds its native extension from verified source on both x64 and ARM64; see [native build instructions and verification status](BUILDING.md). Source-only hardware recording does not require it. If application capture is unavailable or falls back to system-wide audio, the recording reports an explicit error and preserves usable hardware tracks. Native ARM64 runtime verification is still outstanding; build configuration alone does not establish runtime support.
 
 ## Development
 
@@ -113,11 +113,9 @@ python -m pytest
 Most tests use fake audio devices, so they do not access hardware. The optional `tests/test_cable.py` test records a real tone through [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) without touching your default speakers or microphone.
 
 ### Build from Source
-To create the standalone executable:
-```bash
-pip install pyinstaller
-pyinstaller --noconsole --onefile --noupx --name QuickAudioRecorder main.py
-```
+Follow [BUILDING.md](BUILDING.md) for pinned dependencies, the native proc-tap build,
+PyInstaller hooks, architecture checks and required hardware validation on each
+architecture. Use a native build environment matching the intended executable.
 
 ## License
 

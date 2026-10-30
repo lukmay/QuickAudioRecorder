@@ -1,5 +1,7 @@
 """Probe and capture must use the same explicit SoundCard buffer."""
 import contextlib
+import sys
+import types
 
 import numpy as np
 
@@ -33,6 +35,33 @@ def test_soundcard_probe_and_capture_use_scheduling_headroom(tmp_path):
     assert len(calls) == 2
     assert all(call == {'samplerate': 44100, 'channels': 2, 'blocksize': 8192}
                for call in calls)
+
+
+def test_sounddevice_stream_has_conversion_headroom(monkeypatch):
+    calls = []
+    lifecycle = []
+
+    class Stream:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def start(self):
+            lifecycle.append('start')
+
+        def stop(self):
+            lifecycle.append('stop')
+
+        def close(self):
+            lifecycle.append('close')
+
+    monkeypatch.setitem(sys.modules, 'sounddevice', types.SimpleNamespace(
+        InputStream=Stream, WasapiSettings=lambda **kwargs: kwargs))
+    with ar.PortAudioDevice('USB mic', 1, 2).recorder(44100, 2):
+        pass
+    assert calls[0]['latency'] == 0.2
+    assert calls[0]['samplerate'] == 44100
+    assert calls[0]['extra_settings'] == {'auto_convert': True}
+    assert lifecycle == ['start', 'stop', 'close']
 
 
 def test_sounddevice_fallback_keeps_its_existing_interface(monkeypatch, tmp_path):

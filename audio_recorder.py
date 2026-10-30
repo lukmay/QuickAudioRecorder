@@ -95,7 +95,10 @@ class PortAudioDevice:
         import sounddevice as sd
         # Callback mode: blocking reads of 2048 frames dropped audio over WASAPI
         blocks = queue.Queue()
+        # Give WASAPI's shared-mode rate conversion scheduling headroom.
+        # The short default buffer can lose frames without callback status flags.
         stream = sd.InputStream(device=self.index, samplerate=samplerate, channels=channels,
+                                latency=0.2,
                                 dtype="float32", extra_settings=sd.WasapiSettings(auto_convert=True),
                                 callback=lambda data, frames, t, status: blocks.put(data.copy()))
         pending = np.zeros((0, channels), dtype="float32")
@@ -224,6 +227,14 @@ def _process_tap_worker(pid, sender):
         import proctap
 
         capture = proctap.ProcessAudioCapture(pid)
+        if os.name == "nt":
+            # proc-tap 1.1.1 silently falls back to whole-system loopback.
+            # Fail closed: a selected app must never capture unrelated audio.
+            native = getattr(getattr(capture, "_backend", None), "_native", None)
+            isolated = getattr(native, "is_process_specific", None)
+            if not callable(isolated) or not isolated():
+                raise RuntimeError("Process-specific audio capture is unavailable; "
+                                   "refusing system-wide audio fallback.")
         capture.start()
         sender.send(("ready", time.monotonic()))
         while True:

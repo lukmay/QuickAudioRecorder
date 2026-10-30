@@ -5,6 +5,7 @@ import threading
 import types
 
 import numpy as np
+import pytest
 import soundfile as sf
 from conftest import FakeDevice, dominant_freq
 from test_tracks import THREE_TRACKS, record_tracks
@@ -79,6 +80,42 @@ def test_capture_worker_reports_a_missing_capture_library(monkeypatch):
     assert kind == "error"
     assert reason == "failed"
     assert detail
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native isolation guard")
+@pytest.mark.parametrize("native", [None, types.SimpleNamespace(),
+                                     types.SimpleNamespace(is_process_specific=lambda: False)])
+def test_capture_worker_rejects_system_audio_fallback(monkeypatch, native):
+    stopped = []
+    capture = types.SimpleNamespace(
+        _backend=types.SimpleNamespace(_native=native),
+        start=lambda: pytest.fail("System-wide fallback must not start"),
+        stop=lambda: stopped.append(True))
+    monkeypatch.setitem(sys.modules, "proctap", types.SimpleNamespace(
+        ProcessAudioCapture=lambda pid: capture))
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    sender = FakeSender()
+    audio_recorder._process_tap_worker(4242, sender)
+    assert sender.messages[0][:2] == ("error", "failed")
+    assert "refusing system-wide" in sender.messages[0][2]
+    assert stopped == [True]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native isolation guard")
+def test_capture_worker_accepts_confirmed_process_isolation(monkeypatch):
+    capture = types.SimpleNamespace(
+        _backend=types.SimpleNamespace(_native=types.SimpleNamespace(
+            is_process_specific=lambda: True)),
+        start=lambda: None,
+        read=lambda **kw: (_ for _ in ()).throw(RuntimeError("test finished")),
+        stop=lambda: None)
+    monkeypatch.setitem(sys.modules, "proctap", types.SimpleNamespace(
+        ProcessAudioCapture=lambda pid: capture))
+    monkeypatch.setattr(audio_recorder, "_pid_alive", lambda pid: True)
+    sender = FakeSender()
+    audio_recorder._process_tap_worker(4242, sender)
+    assert sender.messages[0][0] == "ready"
+    assert sender.messages[1] == ("error", "failed", "test finished")
 
 
 def test_hardware_only_recording_never_needs_the_capture_library(tmp_path, monkeypatch):
