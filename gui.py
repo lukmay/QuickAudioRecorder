@@ -69,6 +69,7 @@ class SignalManager(QObject):
     progress = pyqtSignal(float)
     hotkey = pyqtSignal(str)
     recording_notice = pyqtSignal(str)  # device lost while recording
+    recording_started = pyqtSignal()
 
 class HotkeyEdit(QLineEdit):
     """
@@ -1157,6 +1158,7 @@ class TrayApplication(QObject):
         self.save_percent = -1
         self.signals.hotkey.connect(self.on_hotkey)
         self.signals.recording_notice.connect(self.on_recording_notice)
+        self.signals.recording_started.connect(self.on_recording_started)
 
         # ticks while recording: elapsed time in the tooltip, auto stop
         self.rec_timer = QTimer(self)
@@ -1289,15 +1291,21 @@ class TrayApplication(QObject):
             on_notice=self.signals.recording_notice.emit,
             **source
         )
+        self.recorder.on_started = self.signals.recording_started.emit
         self.recorder.start()
         self.action_record.setEnabled(False)
         self.action_stop.setEnabled(True)
         self.tray_icon.setIcon(QIcon(self.icon_rec_path))
-        self.tray_icon.setToolTip(f"Recording ({mode}) 00:00")
+        self.tray_icon.setToolTip("Preparing audio capture...")
         self.rec_started = time.monotonic()
+
+    def on_recording_started(self):
+        if not self.recorder or self.recorder.stop_event.is_set():
+            return
+        self.rec_started = time.monotonic()
+        self.tray_icon.setToolTip("Recording 00:00")
         self.rec_timer.start()
-        label = "%d tracks" % len(settings.get("tracks") or []) if use_tracks else mode
-        self.notify("Started", f"Recording {label}", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
+        self.notify("Started", "Recording configured tracks", QSystemTrayIcon.MessageIcon.NoIcon, 1000)
 
     def on_recording_tick(self):
         elapsed = int(time.monotonic() - self.rec_started)

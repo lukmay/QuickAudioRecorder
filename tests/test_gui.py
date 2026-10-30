@@ -117,6 +117,30 @@ def test_tray_shows_saving_progress(tray):
     assert tray.action_stop.text() == "Stop Recording"
 
 
+def test_recording_notification_waits_for_backend_readiness(tray, monkeypatch):
+    import threading
+    import types
+
+    shown = []
+    backend = types.SimpleNamespace(
+        start=lambda: None, stop_event=threading.Event(), on_started=None)
+    monkeypatch.setattr(gui, "AudioRecorder", lambda **kwargs: backend)
+    monkeypatch.setattr(tray, "notify", lambda title, *args: shown.append(title))
+    try:
+        tray.start_recording("mic")
+        assert tray.tray_icon.toolTip() == "Preparing audio capture..."
+        assert not tray.rec_timer.isActive()
+        assert "Started" not in shown
+        backend.on_started()
+        QApplication.instance().processEvents()
+        assert tray.rec_timer.isActive()
+        assert tray.tray_icon.toolTip() == "Recording 00:00"
+        assert shown == ["Started"]
+    finally:
+        tray.rec_timer.stop()
+        tray.recorder = None
+
+
 def test_saving_progress_updates_tooltip_and_menu(tray):
     tray.on_save_progress(0.42)
     assert tray.tray_icon.toolTip() == "Saving recording... 42%"

@@ -11,6 +11,10 @@ import numpy as np
 import soundcard as sc
 import soundfile as sf
 
+from soundcard_compat import apply_soundcard_compat
+
+apply_soundcard_compat()
+
 # Track kinds and output modes for the track list.
 TRACK_KIND_INPUT = "input"
 TRACK_KIND_OUTPUT = "output"
@@ -198,7 +202,7 @@ def _decode_message(message):
         if message[0] == "error":
             return ("error", message[1], message[2])
         if message[0] == "data":
-            return ("data", message[1])
+            return message
     return ("data", message)
 
 
@@ -214,10 +218,13 @@ def _process_tap_worker(pid, sender):
 
         capture = proctap.ProcessAudioCapture(pid)
         capture.start()
+        sender.send(("ready", time.monotonic()))
         while True:
             data = capture.read(timeout=0.1)
             if data:
-                sender.send(("data", data))
+                # Timestamp before pipe delivery: a stalled parent must not
+                # turn buffered audio into extra silence in the output.
+                sender.send(("data", data, time.monotonic()))
     except Exception as e:
         # Report the real failure. Dying silently would look like the user's
         # application had simply closed.
@@ -254,6 +261,9 @@ class ProcTapRecorder(threading.Thread):
         self.exit_reason = None
         self.chunks_read = 0
         self.frames = 0
+        self.ready_event = threading.Event()
+        self.session_started: threading.Event | None = None
+        self.session_epoch: float | None = None
 
     def probe(self):
         """Matches RawRecorder's interface; the capture format is fixed."""
@@ -263,6 +273,7 @@ class ProcTapRecorder(threading.Thread):
 
         process = None
         receiver = None
+        started_at = time.monotonic()
         try:
             receiver, sender = multiprocessing.Pipe(duplex=False)
             context = multiprocessing.get_context("spawn")
@@ -271,16 +282,37 @@ class ProcTapRecorder(threading.Thread):
             sender.close()
             with sf.SoundFile(self.filepath, mode="w", samplerate=self.samplerate,
                               channels=self.channels) as f_wav:
-                # Write silence while the app is quiet, so the track covers the
-                # same stretch of time as the other tracks.
-                silence = np.zeros((int(0.1 * self.samplerate), self.channels), dtype=np.float32)
+                # Pipe timeouts are not source silence. Leave gaps provisional
+                # until a timestamped packet (or stop) establishes their extent.
                 while not self.stop_event.is_set():
                     if receiver.poll(0.1):
-                        message = _decode_message(receiver.recv())
+                        incoming = receiver.recv()
+                        if isinstance(incoming, tuple) and incoming[0] == "ready":
+                            started_at = incoming[1]
+                            self.ready_event.set()
+                            if self.session_started is not None:
+                                while not self.session_started.wait(0.05):
+                                    if self.stop_event.is_set():
+                                        return
+                                assert self.session_epoch is not None
+                                started_at = self.session_epoch
+                            continue
+                        message = _decode_message(incoming)
                         if message[0] == "error":
                             self.exit_reason = message[1]
                             raise RuntimeError(message[2])
                         data = np.frombuffer(message[1], dtype=np.float32).reshape(-1, self.channels)
+                        if len(message) > 2:
+                            packet_end = round((message[2] - started_at) * self.samplerate)
+                            packet_start = packet_end - len(data)
+                            if packet_end <= 0:
+                                continue  # Captured during preparation, before the session.
+                            if packet_start < 0:
+                                data = data[-packet_start:]
+                                packet_start = 0
+                            # Worker timestamps approximate native packet time;
+                            # never collapse a short quiet gap into later audio.
+                            self._write_silence_until(f_wav, packet_start)
                         f_wav.write(data)
                         self.frames += len(data)
                         self.chunks_read += 1
@@ -290,9 +322,8 @@ class ProcTapRecorder(threading.Thread):
                             raise RuntimeError("Audio capture stopped unexpectedly.")
                         self.exit_reason = "closed"
                         raise RuntimeError("The application stopped or exited.")
-                    else:
-                        f_wav.write(silence)
-                        self.frames += len(silence)
+                self._write_silence_until(
+                    f_wav, round((time.monotonic() - started_at) * self.samplerate))
         except Exception as e:
             self.error = str(e)
         finally:
@@ -305,6 +336,14 @@ class ProcTapRecorder(threading.Thread):
                 process.terminate()
                 process.join(timeout=1.0)
 
+    def _write_silence_until(self, output, frame):
+        """Fill a known timeline gap with bounded-size blocks."""
+        silence = np.zeros((4800, self.channels), dtype=np.float32)
+        while self.frames < frame:
+            count = min(len(silence), frame - self.frames)
+            output.write(silence[:count])
+            self.frames += count
+
     def stop(self):
         self.stop_event.set()
         self.join()
@@ -316,7 +355,7 @@ class AudioRecorder(threading.Thread):
     """
     def __init__(self, mic_id=None, source_mode=None, output_folder=None, output_format="mp3",
                  normalize=False, mono=False, on_finish_callback=None, on_progress=None,
-                 on_notice=None, tracks=None, output_mode="mixed"):
+                 on_notice=None, tracks=None, output_mode="mixed", on_started=None):
         super().__init__()
         self.mic_id = mic_id
         self.source_mode = source_mode # "mic", "loopback", "both"
@@ -327,6 +366,7 @@ class AudioRecorder(threading.Thread):
         self.callback = on_finish_callback
         self.on_progress = on_progress  # called with 0..1 while saving
         self.on_notice = on_notice  # called with a message if a device is lost
+        self.on_started = on_started
 
         # The track list is the source of truth. mic_id/source_mode are the
         # older single-source interface and are mapped onto a matching list.
@@ -443,9 +483,38 @@ class AudioRecorder(threading.Thread):
             print(f"Starting recording with {len(self.recorders)} track(s): "
                   f"{', '.join(self.track_labels)}")
 
-            # 2. Start Recording
+            # Initialize native application capture before starting hardware or
+            # announcing recording. Spawn/import latency is preparation, not
+            # silent audio at the beginning of the session.
+            session_started = threading.Event()
             for r in self.recorders:
-                r.start()
+                if isinstance(r, ProcTapRecorder):
+                    r.session_started = session_started
+                    r.start()
+            for r in self.recorders:
+                ready = getattr(r, "ready_event", None)
+                if ready is None:
+                    continue
+                deadline = time.monotonic() + 15
+                while not ready.wait(0.05):
+                    if self.stop_event.is_set():
+                        return
+                    if not r.is_alive():
+                        break  # Preserve the other tracks; report this failure on save.
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Application capture did not become ready.")
+            if self.stop_event.is_set():
+                return
+            epoch = time.monotonic()
+            for r in self.recorders:
+                if isinstance(r, ProcTapRecorder):
+                    r.session_epoch = epoch
+            session_started.set()
+            for r in self.recorders:
+                if not isinstance(r, ProcTapRecorder):
+                    r.start()
+            if self.on_started:
+                self.on_started()
 
             # 3. Wait for the stop signal. A recorder only ends on its own when
             # its device is lost, then stop and save what was captured so far.
@@ -520,6 +589,9 @@ class AudioRecorder(threading.Thread):
             print(f"Error during recording process: {e}")
         finally:
             self.recording = False
+            for recorder in self.recorders:
+                if recorder.is_alive():
+                    recorder.stop()
             # Clean up all temp files
             for t in self.temp_files:
                 if os.path.exists(t):

@@ -127,6 +127,117 @@ def test_application_capture_keeps_the_selected_pid(tmp_path, monkeypatch):
     assert selected == [4242]
 
 
+def test_started_callback_waits_for_application_readiness(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
+    instances = []
+    prepared = threading.Event()
+    release = threading.Event()
+    started = threading.Event()
+
+    class PreparingAppRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            prepared.set()
+            release.wait(5)
+            self.ready_event.set()
+            super().run()
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", PreparingAppRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), output_format="wav",
+        tracks=[{"kind": "application", "target_pid": 4242}],
+        on_started=started.set)
+    rec.start()
+    try:
+        assert prepared.wait(5)
+        assert not started.is_set()
+        release.set()
+        assert started.wait(5)
+        assert instances[0].ready_event.is_set()
+    finally:
+        release.set()
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+
+
+def test_application_tracks_share_epoch_after_staggered_readiness(tmp_path, monkeypatch):
+    instances = []
+    first_ready = threading.Event()
+    release_second = threading.Event()
+    started = threading.Event()
+
+    class StaggeredRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            if self.pid == 2:
+                release_second.wait(5)
+            self.ready_event.set()
+            if self.pid == 1:
+                first_ready.set()
+            self.stop_event.wait(5)
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", StaggeredRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), tracks=[
+            {"kind": "application", "target_pid": 1},
+            {"kind": "application", "target_pid": 2}], on_started=started.set)
+    rec.start()
+    try:
+        assert first_ready.wait(5)
+        assert not started.is_set()
+        assert not instances[0].session_started.is_set()
+        release_second.set()
+        assert started.wait(5)
+        assert instances[0].session_epoch == instances[1].session_epoch
+        assert instances[0].session_epoch is not None
+        assert all(r.session_started.is_set() for r in instances)
+    finally:
+        release_second.set()
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+
+
+def test_stop_during_application_preparation_cleans_up(tmp_path, monkeypatch):
+    prepared = threading.Event()
+    started = threading.Event()
+    instances = []
+
+    class WaitingAppRecorder(StubAppRecorder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ready_event = threading.Event()
+            instances.append(self)
+
+        def run(self):
+            prepared.set()
+            self.stop_event.wait(5)
+
+    monkeypatch.setattr(audio_recorder, "ProcTapRecorder", WaitingAppRecorder)
+    rec = audio_recorder.AudioRecorder(
+        output_folder=str(tmp_path), tracks=[{"kind": "application", "target_pid": 4242}],
+        on_started=started.set)
+    rec.start()
+    try:
+        assert prepared.wait(5)
+    finally:
+        rec.stop()
+        rec.join(10)
+    assert not rec.is_alive()
+    assert not started.is_set()
+    assert not instances[0].is_alive()
+    assert all(not os.path.exists(path) for path in rec.temp_files)
+
+
 def test_a_failing_application_track_is_reported_not_fatal(tmp_path, monkeypatch):
     """The other tracks still save, and the failure surfaces as an error."""
     monkeypatch.setattr(audio_recorder, "sc", mic_only_fake())
